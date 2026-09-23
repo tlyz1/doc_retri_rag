@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 import subprocess
 from knowledge.processor.import_process.base import BaseNode, T, setup_logging
-from knowledge.processor.import_process.exceptions import  FileProcessingError, PdfConversionError
+from knowledge.processor.import_process.exceptions import FileProcessingError, PdfConversionError
 from knowledge.processor.import_process.state import ImportGraphState
 
 
@@ -76,7 +76,7 @@ class PdfToMdNode(BaseNode):
             "mineru",
             "-p", str(pdf_path_obj),
             "-o", str(output_path_obj),
-            "-b", "pipeline", #没有使用cpu加速
+            "-b", "pipeline",  # 没有使用cpu加速
             "--source", "local"
         ]
         self.logger.info(f"执行命令:{' '.join(cmd)}")

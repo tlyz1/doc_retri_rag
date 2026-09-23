@@ -29,7 +29,7 @@ class EntryNode(BaseNode):
        """
 
         self.log_step("step_1,获取文件路径")
-        file_path = state.get("import_file_path","")
+        file_path = state.get("import_file_path", "")
         if not file_path:
             raise ValidationError(
                 "import_file_path 不能为空",
@@ -41,26 +41,27 @@ class EntryNode(BaseNode):
         self.log_step("step2", f"检测到文本类型:{suffix}")
         if suffix == ".pdf":
             self.logger.info("启动PDF读取流程")
-            state['is_pdf_read_enabled']=True
-            state['pdf_path']=file_path
+            state['is_pdf_read_enabled'] = True
+            state['pdf_path'] = file_path
         elif suffix == ".md":
             self.logger.info("启动MD读取流程")
-            state['is_md_read_enabled']=True
-            state['md_path']=file_path
+            state['is_md_read_enabled'] = True
+            state['md_path'] = file_path
         # TODO:其它格式的文档
         else:
             self.logger.warning(f"不支持该文档格式:{suffix}")
 
         state['file_title'] = path.stem
-        self.log_step("step3",f"文档标题:{state['file_title']}")
+        self.log_step("step3", f"文档标题:{state['file_title']}")
         return state
+
+
 # ================================================================== #
 #                        兼容 & 测试                                  #
 # ================================================================== #
 
 # 兼容原有调用方式
 node_entry = EntryNode()
-
 
 if __name__ == '__main__':
     """
@@ -81,7 +82,7 @@ if __name__ == '__main__':
     print("\n--- 测试用例 1: PDF 文件 ---")
     entry_node = EntryNode()
     state_pdf = {
-        "import_file_path":r"E:\rag\docretri_rag\knowledge\processor\import_process\import_temp_dir\万用表RS-12的使用.pdf"
+        "import_file_path": r"E:\rag\docretri_rag\knowledge\processor\import_process\import_temp_dir\万用表RS-12的使用.pdf"
     }
     result_pdf = entry_node.process(state_pdf)
     print(json.dumps(result_pdf, indent=4, ensure_ascii=False))
