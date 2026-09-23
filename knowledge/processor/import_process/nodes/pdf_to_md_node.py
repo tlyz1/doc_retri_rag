@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 import subprocess
 from knowledge.processor.import_process.base import BaseNode, T, setup_logging
-from knowledge.processor.import_process.exceptions import ValidationError, FileProcessingError, PdfConversionError
+from knowledge.processor.import_process.exceptions import  FileProcessingError, PdfConversionError
 from knowledge.processor.import_process.state import ImportGraphState
 
 

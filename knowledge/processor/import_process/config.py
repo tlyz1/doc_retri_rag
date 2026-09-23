@@ -99,6 +99,11 @@ class ImportConfig:
         """从环境变量加载配置"""
         return cls()
 
+    def get_minio_base_url(self):
+        base_protocol="https://" if self.minio_secure else "http://"
+        return base_protocol+f"{self.minio_endpoint}"
+
+
 
 
 # ==================== 全局单例 ====================
