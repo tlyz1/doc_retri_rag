@@ -58,6 +58,8 @@ class ImportGraphState(TypedDict, total=False):
 
     chunks: List  # 文档切片列表
 
+    local_dir:str
+
     # ==================== 默认状态 ====================
 
 
@@ -84,6 +86,8 @@ GRAPH_DEFAULT_STATE: ImportGraphState = {
     "chunks": [],
 
     "item_name": "",
+
+    "local_dir":""
 
 }
 
