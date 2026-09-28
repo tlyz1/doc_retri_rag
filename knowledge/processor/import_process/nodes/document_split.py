@@ -54,15 +54,15 @@ class DocumentSplitNode(BaseNode):
 
         # 二次切分+合并断章节
         sections = self._split_and_merge(sections, max_length, config.min_content_length)
-        
-        #组装最终的content（title+body),清理内部字段
-        sections=self._assemble_content(sections)
-        
-        #日志统计
-        self._log_summary(content,sections,max_length)
-        #备份
-        state["chunks"]=sections
-        self._backup_chunks(state,sections)
+
+        # 组装最终的content（title+body),清理内部字段
+        sections = self._assemble_content(sections)
+
+        # 日志统计
+        self._log_summary(content, sections, max_length)
+        # 备份
+        state["chunks"] = sections
+        self._backup_chunks(state, sections)
         return state
 
     # ------------------------------------------------------------------ #
@@ -158,9 +158,8 @@ class DocumentSplitNode(BaseNode):
         for section in sections:
             split_result.extend(self._split_long_section(section, max_length))
 
-        #合并过短的相邻文章（仅限 parent_title 相同）
+        # 合并过短的相邻文章（仅限 parent_title 相同）
         return self._merge_short_sections(split_result, min_content_length)
-
 
     def _split_long_section(self, section: dict, max_length: int) -> List[dict]:
         """
@@ -173,38 +172,39 @@ class DocumentSplitNode(BaseNode):
 
         if "<table>" in body:
             self.logger.info(f"检查到了表格，进行表格切分")
-            body=MarkdownTableLinearizer.process(body)
+            body = MarkdownTableLinearizer.process(body)
 
         # 把title计算入总长度
         title_prefix = f"{title}\n\n" if title else ""
         total = len(title_prefix) + len(body)
         # 如果总长度小于最大长度，直接返回
-        if total<= max_length:
+        if total <= max_length:
             return [section]
-        #计算给正文的实际可以字符数
+        # 计算给正文的实际可以字符数
         available = max_length - len(title_prefix)
-        #当遇到标题长度大于最长长度，直接返回
+        # 当遇到标题长度大于最长长度，直接返回
         if available <= 0:
             return [section]
 
-        splitter=RecursiveCharacterTextSplitter(chunk_size=available
-                                                , chunk_overlap=0
-                                                 # 优雅降级策略：优先按双换行切，再按单换行，最后按标点和空格
-            ,separators=["\n\n", "\n", "。", "！", "？", "；", ".", "!", "?", ";", " "]
-        )
-        pieces=splitter.split_text(body)
-        #如果切分结果小于等于1个，直接返回 没有切开的意思
+        splitter = RecursiveCharacterTextSplitter(chunk_size=available
+                                                  , chunk_overlap=0
+                                                  # 优雅降级策略：优先按双换行切，再按单换行，最后按标点和空格
+                                                  ,
+                                                  separators=["\n\n", "\n", "。", "！", "？", "；", ".", "!", "?", ";", " "]
+                                                  )
+        pieces = splitter.split_text(body)
+        # 如果切分结果小于等于1个，直接返回 没有切开的意思
         if len(pieces) <= 1:
             return [section]
-        #如果切分结果大于1个，则需要合并
+        # 如果切分结果大于1个，则需要合并
         sub_sections: List[dict] = []
         for i, piece in enumerate(pieces):
             sub_sections.append({
-                "title": f"{title}-{i+1}" if title else f"chunk-{i+1}",
+                "title": f"{title}-{i + 1}" if title else f"chunk-{i + 1}",
                 "body": piece.strip(),
                 "file_title": file_title,
                 "parent_title": parent_title,
-                "part":i+1,
+                "part": i + 1,
             })
         return sub_sections
 
@@ -253,15 +253,15 @@ class DocumentSplitNode(BaseNode):
         """
         self.log_step("step_5", "组装 content")
         result: List[dict] = []
-        for sec  in sections:
+        for sec in sections:
             title = sec.get("title", "")
             body = sec.get("body", "")
-            #组装：title+body
+            # 组装：title+body
             if title and body:
-                content=f"{title}\n\n{body}".strip()
+                content = f"{title}\n\n{body}".strip()
             else:
-                content=body or title
-            chunk={
+                content = body or title
+            chunk = {
                 "title": title,
                 "content": content.strip(),
                 "file_title": sec.get("file_title", ""),
@@ -273,6 +273,7 @@ class DocumentSplitNode(BaseNode):
                 chunk["part"] = sec["part"]
             result.append(chunk)
         return result
+
     # ------------------------------------------------------------------ #
     #                       日志 & 备份                                    #
     # ------------------------------------------------------------------ #
@@ -310,6 +311,7 @@ class DocumentSplitNode(BaseNode):
         except Exception as e:
             self.logger.warning(f"备份失败: {e}")
 
+
 # ================================================================== #
 #                        兼容 & 测试                                   #
 # ================================================================== #
@@ -345,12 +347,3 @@ if __name__ == '__main__':
     preview_chunks = result_state.get("chunks", [])[:10]
     print(json.dumps(preview_chunks, ensure_ascii=False, indent=4))
     print(f"\n...... (共生成 {len(result_state.get('chunks', []))} 个 Chunks, 详情请查看 chunks.json)")
-
-
-
-
-
-
-
-      
-
