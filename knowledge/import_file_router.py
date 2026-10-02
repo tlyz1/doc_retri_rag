@@ -1,3 +1,7 @@
+# 必须最先执行：dotenv 默认找 cwd 下的 .env，但 cwd 是 knowledge/，所以指向父目录
+from dotenv import load_dotenv
+load_dotenv(r"E:\rag\docretri_rag\.env", override=True)
+
 import os.path
 
 import uvicorn

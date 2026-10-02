@@ -1,7 +1,6 @@
 import json
 from pathlib import Path
 
-from win32comext.taskscheduler.taskscheduler import TASK_FLAG_RUN_ONLY_IF_DOCKED
 
 from knowledge.processor.import_process.base import BaseNode, T
 from knowledge.processor.import_process.exceptions import ValidationError

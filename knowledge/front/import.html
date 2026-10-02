@@ -389,8 +389,11 @@
     async function uploadFile(file) {
         // === 核心逻辑优化：动态判断总节点数 ===
         const isPDF = file.name.toLowerCase().endsWith('.pdf');
-        // PDF 需要 9 步（含上传），MD 跳过 pdf_to_md 需要 8 步
-        const totalNodes = isPDF ? 8 : 7;
+        // 与后端 main_graph.py 节点数保持一致：
+        // upload_file + entry + (pdf_to_md?) + document_split + item_name_recognition
+        // + beg_embedding_chunks_node + import_milvus_node + knowledge_graph_node
+        // PDF 走 pdf_to_md 共 9 步，MD 跳过 pdf_to_md 共 8 步
+        const totalNodes = isPDF ? 9 : 8;
 
         const id = 'file-' + Math.random().toString(36).substr(2, 8);
         const html = `

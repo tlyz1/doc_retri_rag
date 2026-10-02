@@ -122,6 +122,8 @@ class _MilvusInserter:
 
 
 class ImportMilvusNode(BaseNode):
+    name = "import_milvus_node"
+
     def process(self, state: ImportGraphState) -> ImportGraphState:
         # 检查数据
         chunks = state.get('chunks')

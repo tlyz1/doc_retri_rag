@@ -44,8 +44,9 @@ class MdImgNode(BaseNode):
         # 获取Markdown内容和相关路径
         md_content, md_path_obj, images_dir_obj = self._get_md_content_and_path(state)
         state["md_content"] = md_content
-        if not images_dir_obj:
-            self.logger.info(f"没有找到images目录，跳过图片处理流程")
+        # 注意：Path 对象本身永远是 truthy，必须显式判断目录是否存在，否则 MD 路径下没有 images 子目录会走到 listdir 抛 WinError 3。
+        if not images_dir_obj.exists():
+            self.logger.info(f"images目录不存在，跳过图片处理流程：{images_dir_obj}")
             return state
 
         # 扫描并且筛选需要处理的图片 防止图片目录混进不是图片的格式 并且提取图片的上下文

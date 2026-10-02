@@ -377,9 +377,12 @@ class KnowLedgeGraphNode(BaseNode):
         self._clean_exist_double_data(milvus_client, neo4j_driver, item_name)
 
         # 5. 批量处理（串行版本）
-        # self._process_all_chunks_v1(stats, validated_chunks, milvus_client, neo4j_driver)
-        # 5. 批量处理（多线程版本）
-        self._process_chunks_concurrently(stats, validated_chunks, milvus_client, neo4j_driver)
+        # 注意：当前 chunk 流程里会调用 BGEM3EmbeddingFunction（PyTorch 模型），
+        # PyTorch/BGE-M3 同一实例不能并发 encode，多线程版本会让向量异常甚至段错误。
+        # 因此默认走串行版本，多线程版保留作为 TODO 性能优化参考。
+        self._process_all_chunks_v1(stats, validated_chunks, milvus_client, neo4j_driver)
+        # 5. 批量处理（多线程版本）—— BGE-M3 串行化前禁用
+        # self._process_chunks_concurrently(stats, validated_chunks, milvus_client, neo4j_driver)
 
         # 6. 简单的日志观察
         self.logger.info(stats.summary())
@@ -492,8 +495,11 @@ class KnowLedgeGraphNode(BaseNode):
 
     def _extract_graph_with_retry(self, content: str) -> str:
 
-        # 1. 获取LLM客户端
-        llm_client = get_llm_client()
+        # 1. 获取LLM客户端（强制 JSON 输出，避免模型返回 ```json``` 围栏导致反序列化失败）
+        llm_client = get_llm_client(
+            model_name=self.config.default_model,
+            response_format=True,
+        )
         if llm_client is None:
             raise ValueError(f"LLM客户端初始化失败")
 
@@ -501,7 +507,7 @@ class KnowLedgeGraphNode(BaseNode):
         last_error = None
 
         # 2.循环重试3次
-        # TODO :将失败的异常原因给到模型
+
         for attempt in range(1, MAX_COUNT + 1):
             try:
                 # 2.1 调用模型
@@ -559,7 +565,8 @@ class KnowLedgeGraphNode(BaseNode):
         try:
             parsed_llm_response: Dict[str, Any] = json.loads(cleaned)
         except  JSONDecodeError as e:
-            raise JSONDecodeError(f"反序列化失败 :{str(e)}")
+            # 注意：JSONDecodeError(msg, doc, pos) 签名固定，不能直接 json 重抛，会触发 TypeError
+            raise ValueError(f"反序列化失败 :{str(e)}")
 
         # 4. 获取信息
         # 4.1 获取实体信息
@@ -690,7 +697,7 @@ class KnowLedgeGraphNode(BaseNode):
 
             # 1.7 判断关系类型是否在关系类型的白名单中
             if relation_type not in ALLOWED_RELATION_TYPES:
-                # TODO 思路：反哺白名单
+
                 relation_type = DEFAULT_RELATION_TYPES
 
             # 1.8 构建最终关系链的数据结构
@@ -795,11 +802,6 @@ class KnowLedgeGraphNode(BaseNode):
                     msg = f"切片 {chunk_id} 处理失败: {e}"
                     stats.errors.append(msg)
                     self.logger.error(msg)
-
-
-
-
-
 
 
 

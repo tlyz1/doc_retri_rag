@@ -4,6 +4,8 @@ PDF 转 Markdown 节点
 """
 import json
 import os
+
+import sys
 import time
 from pathlib import Path
 import subprocess
@@ -71,16 +73,40 @@ class PdfToMdNode(BaseNode):
         """
         self.logger.info("step_2,执行MinerU转换")
 
+        # 使用绝对路径而不是 "mineru" 短名：venv 调起子进程时 Python 标准库
+        # 是从 D:\python11\Lib 加载的 subprocess.py，对短名 + 自定义 env 的解析
+        # 在某些场景下会 CreateProcess 失败（WinError 2），用绝对路径绕过。
+        mineru_exe = os.path.join(os.path.dirname(sys.executable), "mineru.exe")
+
         # 构建命令
         cmd = [
-            "mineru",
+            mineru_exe,
             "-p", str(pdf_path_obj),
             "-o", str(output_path_obj),
             "-b", "pipeline",  # 没有使用cpu加速
+            "-m", "auto",  # auto 模式同时提取文本与图像，输出 layout/tables/formula/images
             "--source", "local"
         ]
         self.logger.info(f"执行命令:{' '.join(cmd)}")
         start_ts = time.time()
+
+        # 关键：把 venv 的 Scripts 目录放到 PATH 最前面，
+        # 避免子进程被 D:\python11\Scripts\mineru.exe 抢占。
+        # mineru 是个 package，不是 module，不能用 -m mineru 直接调用。
+        env = os.environ.copy()
+        venv_scripts = os.path.dirname(sys.executable)  # Windows: ...\.venv\Scripts
+        env["PATH"] = venv_scripts + os.pathsep + env.get("PATH", "")
+
+        # 限制 OpenBLAS/MKL 线程数与进程池规模，避免物理内存不足时 (RTX 3050 4GB + 16GB 共享内存)
+        # OpenBLAS "Memory allocation still failed after 10 retries" 导致 mineru worker BrokenProcessPool
+        env.setdefault("OPENBLAS_NUM_THREADS", "1")
+        env.setdefault("OMP_NUM_THREADS", "1")
+        env.setdefault("MKL_NUM_THREADS", "1")
+        # 强制 mineru 用 CPU：单卡 4GB 共享给 BGE-M3(2GB+) + doclayout+Unimernet 易 OOM
+        env.setdefault("MINERU_DEVICE_MODE", "cpu")
+        # 关闭 safetensors 的 mmap，绕过 Windows ERROR_PARTIAL_COPY (1455) 在低内存下 mmap 失败
+        env.setdefault("SAFETENSORS_FAST_MMAP", "0")
+        env.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
         # 调用命令行工具
         proc = subprocess.Popen(
@@ -90,7 +116,7 @@ class PdfToMdNode(BaseNode):
             text=True,  # 文本模式
             encoding="utf-8",
             errors="replace",  # 遇到乱码时替换
-            env=os.environ.copy(),  # 传递环境变量
+            env=env,  # 传递修正后的环境变量
             bufsize=1,  # 行缓冲（实时输出）
         )
 

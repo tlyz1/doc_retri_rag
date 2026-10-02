@@ -219,3 +219,4 @@ __marimo__/
 
 .idea
 ./.env
+.pip-tmp/

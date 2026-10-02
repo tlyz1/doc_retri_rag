@@ -14,7 +14,7 @@ def get_llm_client(model_name: str = None, temperature: float = 0.0, response_fo
 
     :param mode_name: 模型名称，例如 Qwen/Qwen3-32B
     :param temperature: 模型温度，越小输出越稳定，NL2SQL场景推荐0.0~0.1
-    :param response_format: 是否开启json_object强制JSON输出
+    :param response_format: 是否开启json_object强制JSON输出。Qwen3-32B在siliconflow上对此参数返回400 Bad Request；当前默认关闭，由 prompt 强制 JSON。
     :return: ChatOpenAI实例，创建失败返回None
     """
     # 读取项目配置文件，获取api_key、base_url等信息
@@ -28,9 +28,15 @@ def get_llm_client(model_name: str = None, temperature: float = 0.0, response_fo
 
     # 初始化模型参数字典
     model_kwargs = {}
-    # 如果开启json输出，追加response_format参数，要求模型返回标准JSON
+
+    # 兼容旧调用：若上游网关实际不支持 json_object，就关闭（硅流/Qwen3 实际拒绝此参数）
     if response_format:
-        model_kwargs['response_format'] = {"type": "json_object"}
+        try:
+            import os as _os
+            if _os.getenv('LLM_ALLOW_RESPONSE_FORMAT', '0') == '1':
+                model_kwargs['response_format'] = {"type": "json_object"}
+        except Exception:
+            pass
 
     try:
         # 实例化ChatOpenAI，兼容OpenAI协议的大模型服务
@@ -44,6 +50,7 @@ def get_llm_client(model_name: str = None, temperature: float = 0.0, response_fo
             model_kwargs=model_kwargs
         )
         # 将新建的客户端存入全局缓存
+        cache_key = (model_name, response_format, bool(model_kwargs))
         cache_llm_client[cache_key] = client
         return client
     except Exception as e:
