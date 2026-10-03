@@ -2,7 +2,7 @@ import logging
 import gc
 import os
 import threading
-from typing import Optional
+from typing import Optional, List
 
 # 优先使用外部环境变量，否则用默认值（国内镜像 + 自定义缓存路径，避免污染 ~/.cache）
 os.environ.setdefault('HF_HUB_CACHE', r'E:\Milvues_models\huggingface_bgem3')
@@ -69,7 +69,47 @@ def get_bge_m3_embedding_model() -> Optional[BGEM3EmbeddingFunction]:
             bge_m3_ef = None
         # 模型已加载，直接返回全局单例
         return bge_m3_ef
+def generate_hybrid_embeddings(embedding_model: BGEM3EmbeddingFunction, embedding_documents: List[str]):
+    """
+    为文本生成向量嵌入
+    :param embedding_model: 嵌入模型(这里使用BGEM3)
+    :param embedding_documents: 要生成嵌入的文本列表
+    :return: 包含dense和sparse向量的字典
+    """
+    try:
+        # 1. 生成嵌入
+        embedding_result = embedding_model.encode_documents(embedding_documents)
 
+        processed_sparse_result = []
+        # 2. 遍历每一个文档
+        for index in range(len(embedding_documents)):
+            # 2.1 解构csr矩阵&获取稀疏向量
+            csr_array = embedding_result['sparse']
+            # a) 行索引
+            ind_ptr = csr_array.indptr
+
+            # b) 获取行索引的起始值
+            start_ind_ptr = ind_ptr[index]
+            end_ind_ptr = ind_ptr[index + 1]
+
+            # c) 获取token_id
+            token_id = csr_array.indices[start_ind_ptr:end_ind_ptr].tolist()
+
+            # d) 获取权重
+            weight = csr_array.data[start_ind_ptr:end_ind_ptr].tolist()
+
+            # 2.2 获取稀疏向量
+            sparse_vector = dict(zip(token_id, weight))
+
+            processed_sparse_result.append(sparse_vector)
+
+        # 3. 返回
+        return {
+            "dense": [den.tolist() for den in embedding_result["dense"]],
+            "sparse": processed_sparse_result
+        }
+    except Exception as e:
+        return None
 
 if __name__ == '__main__':
     embedding_model = get_bge_m3_embedding_model()

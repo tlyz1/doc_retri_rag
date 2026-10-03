@@ -22,8 +22,6 @@ ITEM_NAME_EXTRACT_TEMPLATE = """
     "rewritten_query": "关于商品A和商品B，..."
 }}"""
 
-
-
 # 假设性文档提示词
 USER_HYDE_PROMPT_TEMPLATE = """请模拟一段产品技术文档/说明书中的内容，该内容能够回答以下用户问题。
 
@@ -40,7 +38,6 @@ USER_HYDE_PROMPT_TEMPLATE = """请模拟一段产品技术文档/说明书中的
 4. 不需要标题和格式标记，只输出正文段落
 5. 使用中文，300-350字
 """
-
 
 # 【图谱中存在的实体类型】
 # {allowed_entity_labels_cn}
@@ -61,7 +58,6 @@ ENTITY_EXTRACT_SYSTEM_PROMPT = """
 【输出示例】
 {{"entities": ["实体名字1", "实体名字2", "实体名字3"]}}
 """
-
 
 # 回答生成提示词模板
 ANSWER_PROMPT = """你是一个智能助手，请根据参考内容回答用户的问题。
