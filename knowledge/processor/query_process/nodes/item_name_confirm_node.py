@@ -387,7 +387,7 @@ class ItemNameConfirmNode(BaseNode):
         self._decide(state, item_names, confirmed, options, rewritten_query)
 
         if confirmed:
-            #筛选出字段item_name为空的记录 更新item_name
+            # 筛选出字段item_name为空的记录 更新item_name
             ids_to_update = [
                 str(msg["_id"]) for msg in chat_history if not msg.get("item_names")
             ]
@@ -417,7 +417,6 @@ class ItemNameConfirmNode(BaseNode):
 
 
 if __name__ == "__main__":
-
 
     test_state: QueryGraphState = {
         # "original_query": "你们店里那款苏伯尔RS-12数字万用表怎么测电压？"
