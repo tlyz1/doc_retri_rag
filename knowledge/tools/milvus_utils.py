@@ -2,7 +2,8 @@ import os
 from dotenv import load_dotenv
 
 from knowledge.tools.embedding_utils import logger
-from pymilvus import MilvusClient,WeightedRanker,AnnSearchRequest
+from pymilvus import MilvusClient, WeightedRanker, AnnSearchRequest
+
 load_dotenv()
 from typing import Optional, List
 from pymilvus import MilvusClient
@@ -38,7 +39,7 @@ def create_hybrid_search_requests(dense_vector,
                                   dense_params=None,
                                   sparse_params=None,
                                   expr=None,
-                                  limit=5)->List[AnnSearchRequest]:
+                                  limit=5) -> List[AnnSearchRequest]:
     """
     :param dense_vector: 稠密向量
     :param sparse_vector: 稀疏向量
@@ -49,19 +50,19 @@ def create_hybrid_search_requests(dense_vector,
     :return: 包含稠密和稀疏搜索请求的列表
     """
     if dense_params is None:
-        dense_params = {'metric_type': 'COSINE',}
+        dense_params = {'metric_type': 'COSINE', }
     if sparse_params is None:
-        sparse_params = {"metric_type": "IP",}
-    #创建稠密向量搜索请求
-    dense_req=AnnSearchRequest(
+        sparse_params = {"metric_type": "IP", }
+    # 创建稠密向量搜索请求
+    dense_req = AnnSearchRequest(
         data=[dense_vector],
-        anns_field='dense_vector', #集合（collection）中向量字段名
+        anns_field='dense_vector',  # 集合（collection）中向量字段名
         param=dense_params,
-        expr=expr, #在向量相似度检索前 / 后做条件过滤
+        expr=expr,  # 在向量相似度检索前 / 后做条件过滤
         limit=limit,
     )
-    #创建稀疏向量搜索请求
-    sparse_req=AnnSearchRequest(
+    # 创建稀疏向量搜索请求
+    sparse_req = AnnSearchRequest(
         data=[sparse_vector],
         anns_field='sparse_vector', param=sparse_params,
         expr=expr, limit=limit,
@@ -118,3 +119,35 @@ def execute_hybrid_search_query(milvus_client: MilvusClient,
         return None
 
 
+def fetch_chunks_by_chunk_ids(
+        collection_name: str,
+        chunk_ids,
+        *,
+        output_fields=None,
+        batch_size: int = 100,
+):
+    """
+    通过 chunk_id（主键）批量查询切片字段
+    返回：List[dict]，元素为 Milvus entity（字段字典）。
+    """
+    client = get_milvus_client()
+    if not collection_name:
+        return []
+    if output_fields is None:
+        # 默认返回字段需与 collection schema 保持一致
+        output_fields = ["chunk_id", "content", "title", "file_title", "item_name"]
+
+    results = []
+    # 分批，避免一次性过大
+    for i in range(0, len(chunk_ids), batch_size):
+        batch = chunk_ids[i: i + batch_size]
+        #  get（主键直取）
+        try:
+            got = client.get(collection_name=collection_name, ids=batch, output_fields=output_fields)
+            if got:
+                results.extend(got)
+            continue
+        except Exception as e:
+            logger.error(f"Milvus get() 查询失败: {e}")
+
+    return results

@@ -16,7 +16,6 @@ import logging, re, json
 from knowledge.processor.import_process.nodes.knowledge_graph import MAX_ENTITY_NAME_LENGTH
 from knowledge.processor.query_process.config import get_config
 
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 from json import JSONDecodeError
@@ -32,16 +31,18 @@ from knowledge.tools.milvus_utils import get_milvus_client, create_hybrid_search
     fetch_chunks_by_chunk_ids
 from knowledge.prompts.query.query_prompt import ENTITY_EXTRACT_SYSTEM_PROMPT
 from knowledge.tools.neo4j_util import get_neo4j_driver
+
 # -------------------------------------------------
 # Neo4J的信息
 # -------------------------------------------------
 ItemEntityPair = Dict[str, Any]
 EntitySeedNode = Dict[str, Any]
 OneHopRelation = Dict[str, Any]
-#常量
+# 常量
 _ENTITY_NAME_MAX_LENGTH = 15
 _DEFAULT_ENTITY_NAME_ALIGN = 0.5
-
+SEED_NODE_WEIGHT = 2.0
+NER_NODE_WEIGHT = 1.0
 # Neo4j的Cypher语句
 _CYPHER_EXACT_SEEDS = """
 MATCH (n:Entity)
@@ -72,6 +73,24 @@ RETURN
 
 limit $limit
 """
+# 根据带权重的节点查询chunk_id
+_CYPHER_LOOKUP_CHUNK = """
+
+UNWIND $weighted_nodes as n
+
+MATCH (e:Entity{name:n.entity_name,item_name:n.item_name})-[r:MENTIONED_IN]->(c:Chunk{item_name:n.item_name})
+
+WITH c,sum(n.weight) AS score, count(e) AS cnt
+
+RETURN c.id AS chunk_id, c.item_name AS item_name, score, cnt
+
+ORDER BY score DESC, cnt DESC,chunk_id DESC
+
+LIMIT $limit
+
+"""
+
+
 # -------------------------------------------------
 # 工具函数 （服务各个组件、不会污染组件）
 # -------------------------------------------------
@@ -79,6 +98,7 @@ limit $limit
 def _item_name_filter_expr(item_names: List[str]) -> str:
     quoted = ", ".join(f"'{item_name}'" for item_name in item_names)
     return f"item_name in [{quoted}]"
+
 
 def _clean_parse_llm_content(llm_response_content: str) -> List[str]:
     """
@@ -101,30 +121,34 @@ def _clean_parse_llm_content(llm_response_content: str) -> List[str]:
     except JSONDecodeError as e:
         logging.error(f"JSON 反序列失败，原因: {str(e)}")
         return []
-    entities_name=deserialized_result.get('entities_name','')
+    entities_name = deserialized_result.get('entities') or deserialized_result.get('entities_name') or ''
     if not entities_name:
         return []
     if not isinstance(entities_name, list):
         return []
 
-    seen=set()
-    entities_name_result=[]
+    seen = set()
+    entities_name_result = []
     for entity_name in entities_name:
         if not entity_name:
             continue
         if not isinstance(entity_name, str):
             continue
 
-        truncated_entity_name=truncate_entity_name_length(entity_name)
+        truncated_entity_name = truncate_entity_name_length(entity_name)
         # 去重保序【顺序：防御性】
         if truncated_entity_name not in seen:
             seen.add(truncated_entity_name)
             entities_name_result.append(truncated_entity_name)
 
     return entities_name_result
+
+
 def truncate_entity_name_length(entity_name: str) -> str:
-    name=entity_name.strip()
+    name = entity_name.strip()
     return name[:_ENTITY_NAME_MAX_LENGTH] if len(name) > _ENTITY_NAME_MAX_LENGTH else name
+
+
 def _clean_seed_rows(rows: List[Dict[str, Any]]) -> List[EntitySeedNode]:
     """
     职责：清洗查询种子节点的数据
@@ -152,6 +176,60 @@ def _clean_seed_rows(rows: List[Dict[str, Any]]) -> List[EntitySeedNode]:
         })
     # 2. 返回
     return clean_seeds_result
+
+
+def _one_hop_relations_to_texts(triples: List[OneHopRelation]) -> List[str]:
+    if not triples:
+        return []
+    docs: List[str] = []
+    for tr in triples:
+        it = (tr.get("item_name") or "").strip()
+        h = (tr.get("head") or "").strip()
+        r = (tr.get("rel") or "").strip()
+        t = (tr.get("tail") or "").strip()
+        if not (h and r and t):
+            continue
+        docs.append(f"[{it}] {h} -({r})-> {t}" if it else f"{h} -({r})-> {t}")
+    return docs
+
+
+def _build_item_entity_pairs(aligned_entities_info: List[Dict[str, Any]]) -> List[ItemEntityPair]:
+    """
+    职责：从对齐后的实体详情中获取商品名+实体名的pair对
+    去重：本质同一个商品名下的实体名只留一个, 不同商品名下的实体名都留
+    Args:
+        aligned_entities_info: 对齐后的实体详情列表
+
+    Returns:
+        商品+实体名的pairs
+
+    """
+    # 1. 判断对齐后的实体详情是否存在
+    if not aligned_entities_info:
+        return []
+
+    seen = set()
+    item_entity_pairs = []
+
+    # 2. 遍历对齐后的实体详情
+    for aligned_entity_info in aligned_entities_info:
+        # 2.1 获取商品名item_name
+        item_name = aligned_entity_info.get('item_name', "").strip()
+        # 2.2 获取对齐后的实体名
+        aligned_entity_name = aligned_entity_info.get('aligned', "").strip()
+        # 2.3 商品名&实体名都存在
+        if not (item_name and aligned_entity_name):
+            continue
+        # 2.4 去重
+        key = (item_name, aligned_entity_name)
+        if key not in seen:
+            seen.add(key)
+            item_entity_pairs.append({
+                "item_name": item_name,
+                "entity_name": aligned_entity_name
+            })
+    # 3. 返回
+    return item_entity_pairs
 
 
 class _EntityExtractor:
@@ -193,11 +271,13 @@ class _EntityExtractor:
             self._logger.error(f"LLM 调用失败:{str(e)}")
             return []
 
+
 class _EntityAligner:
     """
      实体对齐器：
      责任： 根据LLM提取到的实体名 查询Milvus，获取真正的实体名（对齐后的实体名、能够查询neo4j(查询节点使用)）
     """
+
     def __init__(self, collection_name: str):
         self._logger = logging.getLogger(self.__class__.__name__)
         self._collection_name = collection_name
@@ -212,10 +292,10 @@ class _EntityAligner:
          第一个key:entities_aligned:[] 所有对齐后的实体名
          第二key:entity_elements[]: 所有对齐后的实体信息[source_id ,distance,origin,aligned,content]
         """
-        fallback_result={'entities_aligned_name':[],'entity_aligned_elements':[]}
+        fallback_result = {'entities_aligned_name': [], 'entity_aligned_elements': []}
         if not entity_names:
             return fallback_result
-        embedding_model=get_bge_m3_embedding_model()
+        embedding_model = get_bge_m3_embedding_model()
         if embedding_model is None:
             self._logger.error('嵌入模型不存在')
             return fallback_result
@@ -223,38 +303,38 @@ class _EntityAligner:
         if milvus_client is None:
             self._logger.error('Milvus客户端不存在')
             return fallback_result
-        embedding_result=generate_hybrid_embeddings(embedding_model=embedding_model,embedding_documents=entity_names)
+        embedding_result = generate_hybrid_embeddings(embedding_model=embedding_model, embedding_documents=entity_names)
         if embedding_result is None:
             self._logger.error('嵌入结果为空')
             return fallback_result
-        #获取嵌入后的稠密+稀疏向量
-        embedding_result_dense=embedding_result['dense']
-        embedding_result_sparse=embedding_result['sparse']
-        #获取item_name表达式
-        item_name_filtered_expr=_item_name_filter_expr(item_names)
-        #遍历所有的实体名字
-        aligned_entities_name:List[str]=[]
-        aligned_entity_elements:List[Dict[str,Any]]=[]
+        # 获取嵌入后的稠密+稀疏向量
+        embedding_result_dense = embedding_result['dense']
+        embedding_result_sparse = embedding_result['sparse']
+        # 获取item_name表达式
+        item_name_filtered_expr = _item_name_filter_expr(item_names)
+        # 遍历所有的实体名字
+        aligned_entities_name: List[str] = []
+        aligned_entity_elements: List[Dict[str, Any]] = []
 
-        seen=set()
-        for index,entity_name in enumerate(entity_names):
-            #对齐一个实体
-            align_one_result:List[Dict[str,Any]]=self._align_one(milvus_client,
-                                                                 self._collection_name,
-                                                                 item_name_filtered_expr,
-                                                                 embedding_result_dense,
-                                                                 embedding_result_sparse,
-                                                                 index,
-                                                                 entity_name)
-            #将商品对齐结果存储到最终结果中
+        seen = set()
+        for index, entity_name in enumerate(entity_names):
+            # 对齐一个实体
+            align_one_result: List[Dict[str, Any]] = self._align_one(milvus_client,
+                                                                     self._collection_name,
+                                                                     item_name_filtered_expr,
+                                                                     embedding_result_dense,
+                                                                     embedding_result_sparse,
+                                                                     index,
+                                                                     entity_name)
+            # 将商品对齐结果存储到最终结果中
             aligned_entity_elements.extend(align_one_result)
-            #遍历商品下的最齐结果
+            # 遍历商品下的最齐结果
             for detail in align_one_result:
-                aligned_name=detail.get('aligned')
-                item_name=detail.get('item_name')
-                if aligned_name :
-                    #去重 同名实体在不同商品下都保留
-                    key=(item_name,aligned_name)
+                aligned_name = detail.get('aligned')
+                item_name = detail.get('item_name')
+                if aligned_name:
+                    # 去重 同名实体在不同商品下都保留
+                    key = (item_name, aligned_name)
                     if key not in seen:
                         seen.add(key)
                         aligned_entities_name.append(aligned_name)
@@ -264,7 +344,6 @@ class _EntityAligner:
             "entities_aligned_name": aligned_entities_name,
             "entities_aligned_elements": aligned_entity_elements
         }
-
 
     def _align_one(self, milvus_client: MilvusClient,
                    _collection_name: str,
@@ -291,46 +370,46 @@ class _EntityAligner:
             return [{"original": entity_name, "aligned": "", "context": "", "reason": "vector values is not exist "}]
 
         # 2. 创建混合搜索请求
-        hybrid_search_requests=create_hybrid_search_requests(dense_vector=dense_vector,
-                                                             sparse_vector=sparse_vector,
-                                                             expr=item_name_filtered_expr,
-                                                             limit=5)
-        #3，执行混合搜索
-        reps=execute_hybrid_search_query(milvus_client=milvus_client,
-                                         collection_name=_collection_name,
-                                         search_requests=hybrid_search_requests,
-                                         ranker_weights=(0.4,0.6),
-                                         norm_score=True,
-                                         limit=5,
-                                         output_fields=['source_chunk_id','item_name','context','entity_name']
-                                         )
-        #解析结果
-        hits=reps[0] if reps else []
+        hybrid_search_requests = create_hybrid_search_requests(dense_vector=dense_vector,
+                                                               sparse_vector=sparse_vector,
+                                                               expr=item_name_filtered_expr,
+                                                               limit=5)
+        # 3，执行混合搜索
+        reps = execute_hybrid_search_query(milvus_client=milvus_client,
+                                           collection_name=_collection_name,
+                                           search_requests=hybrid_search_requests,
+                                           ranker_weights=(0.4, 0.6),
+                                           norm_score=True,
+                                           limit=5,
+                                           output_fields=['source_chunk_id', 'item_name', 'context', 'entity_name']
+                                           )
+        # 解析结果
+        hits = reps[0] if reps else []
         if not hits:
             if not hits:
                 return [{"original": entity_name, "aligned": "", "score": "", "reason": "no_hit"}]
-        #按照item_name 分组，每组获取最高分
-        best_by_item:Dict[str,Any]={}
+        # 按照item_name 分组，每组获取最高分
+        best_by_item: Dict[str, Any] = {}
         for hit in hits:
-            #获取实体
-            entity=hit.get('entity')
-            #从实体中获取
-            item_name=entity.get('item_name').strip()
-            #只保留每个item_name下的第一个（即最高分）
+            # 获取实体
+            entity = hit.get('entity')
+            # 从实体中获取
+            item_name = entity.get('item_name').strip()
+            # 只保留每个item_name下的第一个（即最高分）
             if item_name not in best_by_item:
-                best_by_item[item_name]=hit
+                best_by_item[item_name] = hit
             # 4.2 是否有最好的item_name
         if not best_by_item:
             return [{"original": entity_name, "aligned": "", "score": None, "reason": "no_valid_item_name"}]
-        #item_name分组输出结果，过滤低于阈值的
-        results:List[Dict[str, Any]]=[]
-        for item_name,best in best_by_item.items():
-            #获取最好的那个分数
-            score=best.get('distance')
+        # item_name分组输出结果，过滤低于阈值的
+        results: List[Dict[str, Any]] = []
+        for item_name, best in best_by_item.items():
+            # 获取最好的那个分数
+            score = best.get('distance')
             if float(score) < float(_DEFAULT_ENTITY_NAME_ALIGN):
                 continue
-            ent=best.get('entity')
-            #将不同商品下最好的实体名添加到结果集合中
+            ent = best.get('entity')
+            # 将不同商品下最好的实体名添加到结果集合中
             results.append({
                 "original": entity_name,
                 "aligned": ent.get("entity_name"),
@@ -346,6 +425,7 @@ class _EntityAligner:
 
         return results
 
+
 class _Neo4jGraphReader:
     """
     职责：所有对Neo4j的读操作
@@ -354,16 +434,21 @@ class _Neo4jGraphReader:
     3. 根据所有的节点（种子节点以及邻居节点）方向查询chunk(item_name，id)
     4. 根据所有的chunk_id 查询milvus得到所有的chunk
     """
-    def __init__(self,database:str,
+
+    def __init__(self, database: str,
                  kg_max_total_seeds: int,
                  kg_max_seed_candidates,
                  kg_max_triples_per_seed: int,
+                 kg_max_total_chunks: int,
+                 kg_max_total_triples: int
                  ):
-        self._database=database
-        self._kg_max_seed_candidates=kg_max_seed_candidates
-        self._kg_max_total_seeds=kg_max_total_seeds
+        self._database = database
+        self._kg_max_seed_candidates = kg_max_seed_candidates
+        self._kg_max_total_seeds = kg_max_total_seeds
         self._logger = logging.getLogger(self.__class__.__name__)
         self._kg_max_triples_per_seed = kg_max_triples_per_seed
+        self._kg_max_total_chunks = kg_max_total_chunks
+        self._kg_max_total_triples = kg_max_total_triples
 
     def _session(self):
         neo4j_driver = get_neo4j_driver()
@@ -385,31 +470,32 @@ class _Neo4jGraphReader:
         # 1. pair对是否存在
         if not pairs:
             return []
-        final_seeds_result:List[EntitySeedNode]=[]
+        final_seeds_result: List[EntitySeedNode] = []
 
         for pair in pairs:
-            item_name=pair.get('item_name').strip()
-            entity_name=pair.get('entity_name').strip()
+            item_name = pair.get('item_name').strip()
+            entity_name = pair.get('entity_name').strip()
             if not item_name or not entity_name:
                 continue
             try:
                 with self._session() as session:
-                    #执行种子节点查询
-                    candidates_seed_nodes=self._execute_seed_nodes(session,item_name,entity_name,
-                                                                   self._kg_max_seed_candidates)
-                    #将查询到的种子节点加入到最终列表中
+                    # 执行种子节点查询
+                    candidates_seed_nodes = self._execute_seed_nodes(session, item_name, entity_name,
+                                                                     self._kg_max_seed_candidates)
+                    # 将查询到的种子节点加入到最终列表中
                     final_seeds_result.extend(candidates_seed_nodes)
-                    #截取种子节点个数，防止下游查询关系的时候性能太差（作用不大）
-                    if len(final_seeds_result)>self._kg_max_total_seeds:
-                        final_seeds_result=final_seeds_result[:self._kg_max_total_seeds]
+                    # 截取种子节点个数，防止下游查询关系的时候性能太差（作用不大）
+                    if len(final_seeds_result) > self._kg_max_total_seeds:
+                        final_seeds_result = final_seeds_result[:self._kg_max_total_seeds]
                         break
             except Exception as e:
                 self._logger.error(f"获取种子节点失败,原因 :{str(e)}")
 
-            self._logger.info(f"获取种子节点 {len(final_seeds_result)} 个")
-            return final_seeds_result
+        self._logger.info(f"获取种子节点 {len(final_seeds_result)} 个")
+        return final_seeds_result
 
-    def _execute_seed_nodes(self, session, item_name: str, entity_name: str, _kg_max_seed_candidates: int) -> List[EntitySeedNode]:
+    def _execute_seed_nodes(self, session, item_name: str, entity_name: str, _kg_max_seed_candidates: int) -> List[
+        EntitySeedNode]:
 
         """
          执行种子节点查询
@@ -422,15 +508,15 @@ class _Neo4jGraphReader:
           List[EntitySeedNode] :找到的种子节点
         """
         # 1.精确查询
-        exact_rows=session.execute_read(
-            lambda tx:tx.run(_CYPHER_EXACT_SEEDS,item_name=item_name,name=entity_name).data()
+        exact_rows = session.execute_read(
+            lambda tx: tx.run(_CYPHER_EXACT_SEEDS, item_name=item_name, name=entity_name).data()
         )
         if exact_rows:
             return _clean_seed_rows(exact_rows)
-        #2.模糊查询
-        fuzzy_rows=session.execute_read(
-            lambda tx:tx.run(
-                _CYPHER_FUZZY_SEEDS,item_name=item_name,name=entity_name,limit=_kg_max_seed_candidates
+        # 2.模糊查询
+        fuzzy_rows = session.execute_read(
+            lambda tx: tx.run(
+                _CYPHER_FUZZY_SEEDS, item_name=item_name, name=entity_name, limit=_kg_max_seed_candidates
             ).data()
         )
         return _clean_seed_rows(fuzzy_rows)
@@ -450,18 +536,19 @@ class _Neo4jGraphReader:
         if not seed_nodes:
             return []
         seen = set()
-        one_hop_relations_final_result=[]
+        one_hop_relations_final_result = []
         for seed_node in seed_nodes:
-            item_name=seed_node.get('item_name','').strip()
-            seed_name=seed_node.get('entity_name','').strip()
+            item_name = seed_node.get('item_name', '').strip()
+            seed_name = seed_node.get('entity_name', '').strip()
             if not item_name or not seed_name:
                 continue
 
             try:
                 with self._session() as session:
-                    #查询所有种子节点的一跳关系
-                    seed_one_hop_relations:List[OneHopRelation]=self._execute_one_hop_relations(session,item_name,seed_name,
-                                                                                                self._kg_max_triples_per_seed)
+                    # 查询所有种子节点的一跳关系
+                    seed_one_hop_relations: List[OneHopRelation] = self._execute_one_hop_relations(session, item_name,
+                                                                                                   seed_name,
+                                                                                                   self._kg_max_triples_per_seed)
                     if not seed_one_hop_relations:
                         continue
 
@@ -497,8 +584,7 @@ class _Neo4jGraphReader:
         self._logger.info(f"查询 {len(seed_nodes)} 个种子节点对应的关系:{len(one_hop_relations_final_result)} 条")
         return one_hop_relations_final_result
 
-
-def _execute_one_hop_relations(self, session, item_name: str, seed_name: str, kg_max_triples_per_seed: int) -> List[
+    def _execute_one_hop_relations(self, session, item_name: str, seed_name: str, kg_max_triples_per_seed: int) -> List[
         OneHopRelation]:
         """
         Args:
@@ -509,9 +595,9 @@ def _execute_one_hop_relations(self, session, item_name: str, seed_name: str, kg
         Returns:
             List[OneHopRelation]:种子节点的关系
         """
-        one_hop_relations=session.execute_read(
-            lambda tx:tx.run(
-                _CYPHER_ONE_HOP_RELATIONS,item_name=item_name,name=seed_name,limit=kg_max_triples_per_seed
+        one_hop_relations = session.execute_read(
+            lambda tx: tx.run(
+                _CYPHER_ONE_HOP_RELATIONS, item_name=item_name, name=seed_name, limit=kg_max_triples_per_seed
             ).data()
         )
         if not one_hop_relations:
@@ -538,7 +624,181 @@ def _execute_one_hop_relations(self, session, item_name: str, seed_name: str, kg
             })
         return one_hop_relations_result
 
+    def collect_node_weight(self, seed_nodes: List[EntitySeedNode], one_hop_relations: List[OneHopRelation]) -> \
+            List[Dict[str, Any]]:
+        """
+         职责：
+         为种子节点设置权重weight:高=2.0
+         为邻居节点设置权重weigh:低=1.0
+        Args:
+            seed_nodes: 种子节点
+            one_hop_relations:一跳关系
+        Returns:
+         所有节点带权重
+        """
+        # 1. 判断seed_nodes 是否存在
+        if not seed_nodes:
+            return []
 
+        # 2. 判断 one_hop_relations 是否存在
+        if not one_hop_relations:
+            return []
+        # 存放所有节点（种子节点和邻居节点的权重）
+        weight_map: [Tuple[str, str], float] = {}
+        seen = set()
+        # 3. 遍历所有的种子节点
+        for seed_node in seed_nodes:
+            # 3.1 获取item_name
+            item_name = seed_node.get('item_name')
+            # 3.2 获取节点名
+            seed_name = seed_node.get('entity_name')
+
+            key = (item_name, seed_name)
+            if key not in seen:
+                seen.add(key)
+                weight_map[key] = SEED_NODE_WEIGHT
+
+        # 4. 遍历一跳三元组
+        for one_hop_relation in one_hop_relations:
+
+            # 4.1 获取head
+            head = one_hop_relation.get('head')
+            # 4.2 获取tail
+            tail = one_hop_relation.get('tail')
+
+            # 4.3 获取商品的名字
+            item_name = one_hop_relation.get('item_name')
+
+            # 4.4 为邻居节点赋值权重
+            if head and (item_name, head) not in weight_map:
+                weight_map[(item_name, head)] = NER_NODE_WEIGHT
+
+            if tail and (item_name, tail) not in weight_map:
+                weight_map[(item_name, tail)] = NER_NODE_WEIGHT
+
+        return [{"item_name": it, "entity_name": en, "weight": w}
+                for (it, en), w in weight_map.items()]
+
+    def find_nodes_chunk_id(self, weighted_nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        根据带权重的节点查询chunk_id
+        并且基于权重和、次数、进行排序
+        Args:
+            weighted_nodes:带权重的节点
+        Returns:
+         查询到的chunk_id
+        """
+        # 1. 执行Cypher语句
+        try:
+            with self._session() as session:
+                # 1.1 查询语句
+                sorted_node_chunk_id = session.execute_read(lambda tx: tx.run(
+                    _CYPHER_LOOKUP_CHUNK, weighted_nodes=weighted_nodes, limit=self._kg_max_total_chunks
+                ).data())
+        except Exception as e:
+            self._logger.error(f"反查chunk_id失败,原因:{str(e)}")
+            return []
+        hits = []
+        # 2. 处理结果
+        for chunk_row in sorted_node_chunk_id:
+            chunk_id = chunk_row.get('chunk_id', "").strip()
+            item_name = chunk_row.get('item_name', "").strip()
+            score = chunk_row.get('score')
+            if chunk_id and item_name:
+                hits.append({
+                    "id": None,
+                    "distance": float(score or 0.0),
+                    "entity": {"chunk_id": str(chunk_id), "item_name": str(item_name)}
+                })
+        return hits
+
+
+class _ChunkBackFiller:
+    """
+    职责：
+    1、根据Neo4J返回的chunk信息（entity{"chunk_id"}） 获取到chunk_ids
+    2、根据chunk_ids 查询milvus 获取到chunks(批量操作，返回的chunk没有所谓的顺序，只负责将chunk_id的对象给你)：导致根据分数降序的chunk_id就失去了作用
+    3、构建一个chunk_id和chunk对象的字典映射表，将milvus返回的chunk_id和chunk对象存储进来
+    4、遍历原有分数降序的chunk_id列表，然后在从该映射表中获取对应的chunk(保证原有根据分数降序的chunk_id)顺序能利用起来
+    5、更新到state
+
+    """
+
+    def __init__(self, collection_name: str):
+        self._collection_name = collection_name
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+    def back_fill(self, chunk_nodes_sorted: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        职责：
+        1. 获取所有chunk_id
+        2. 根据批量的chunk_id查询milvus
+        3. 构建chunk_id和chunk对象的映射表（内存操作 快且没有oom风险（batch））
+        4. 遍历原有顺序的chunk_id列表(有分数顺序)，接着去到映射表中获取对应的chunk（有分数顺序）
+        Args:
+            chunk_nodes_sorted: 已经根据排序规则排好顺序的chunk节点
+        Returns:
+        """
+        # 1. 判断chunk_nodes_sorted是否存在
+        if not chunk_nodes_sorted:
+            return []
+
+        # 2. 获取chunk_ids
+        chunk_ids: List[Union[str, int]] = self._collect_chunk_ids(chunk_nodes_sorted)
+        try:
+            chunks: List[Dict[str, Any]] = fetch_chunks_by_chunk_ids(collection_name=self._collection_name,
+                                                                     chunk_ids=chunk_ids,
+                                                                     output_fields=['chunk_id', 'content', 'title',
+                                                                                    'item_name'],
+                                                                     batch_size=30)
+            if not chunks:
+                return []
+        except Exception as e:
+            self.logger.error(f'根据chunk_id批量查询chunk对象失败：:{str(e)}')
+            return []
+        # 构建chunk_id和chunk对象的映射标
+        chunk_id_map = {str(chunk.get('chunk_id')): chunk for chunk in chunks if chunk.get('chunk_id') is not None}
+
+        # 根据真实的顺序的chunk_id从映射表查询真正的chunk对象
+        return [
+            {'entity': chunk_id_map.get(str(chunk_id))}
+            for chunk_id in chunk_ids
+        ]
+
+    def _collect_chunk_ids(self, chunk_nodes_sorted: List[Dict[str, Any]]) -> List[Union[str, int]]:
+        """
+        Args:
+            chunk_nodes_sorted:
+        Returns:
+        """
+        chunk_ids = []
+        # 1. 遍历chunk_ids
+        for chunk_node in chunk_nodes_sorted:
+
+            # 2. 判断chunk_id
+            if not chunk_node:
+                continue
+
+            # 3. 获取entity
+            entity = chunk_node.get('entity', '')
+            if not entity:
+                continue
+
+            # 4. 获取chunk_id
+            chunk_id = entity.get('chunk_id')
+            if not chunk_id:
+                continue
+
+            # 5. chunk_id转换
+            chunk_id_str = str(chunk_id)
+            try:
+                chunk_id_int = int(chunk_id_str)
+                chunk_ids.append(chunk_id_int)
+            except (ValueError, TypeError):
+                # 出现转换失败的异常很小
+                chunk_ids.append(chunk_id_str)
+
+        return chunk_ids
 
 
 class KnowledgeGraphSearchNode(BaseNode):
@@ -563,6 +823,12 @@ class KnowledgeGraphSearchNode(BaseNode):
 
         # 2. 执行流水线
         kg_result: Dict[str, Any] = self._run_pipeline(validated_query, validated_item_names)
+
+        # 3. 只更新state中的kg_chunks、kg_triples
+        return {
+            "kg_chunks": kg_result.get('kg_chunks'),
+            "kg_triples": kg_result.get('kg_triples')
+        }
 
     def _validate_inputs(self, state: QueryGraphState) -> Tuple[str, List[str]]:
         # 1. 获取参数
@@ -605,3 +871,73 @@ class KnowledgeGraphSearchNode(BaseNode):
         return user_query, item_names
 
     def _run_pipeline(self, validated_query: str, validated_item_names: List[str]) -> Dict[str, Any]:
+        # 初始化组件
+        entity_extractor = _EntityExtractor()
+        entity_aligner = _EntityAligner(collection_name=self.config.entity_name_collection)
+        neo4g_graph_reader = _Neo4jGraphReader(database=self.config.neo4j_database,
+                                               kg_max_seed_candidates=self.config.kg_max_seed_candidates,
+                                               kg_max_total_seeds=self.config.kg_max_total_seeds,
+                                               kg_max_triples_per_seed=self.config.kg_max_triples_per_seed,
+                                               kg_max_total_triples=self.config.kg_max_total_triples,
+                                               kg_max_total_chunks=self.config.kg_max_total_chunks)
+        chunk_back_filler = _ChunkBackFiller(collection_name=self.config.chunks_collection)
+
+        # 2. 各个组件执行各种的业务
+        # 2.1 利用提取器组件、对齐器组件提取实体以及对齐后的实体（LLM+Milvus）
+        entities_name = entity_extractor.extract(user_query=validated_query)
+        entities_name_aligned: Dict[str, Any] = entity_aligner.align(entities_name, item_names=validated_item_names)
+        # 获取所有对齐后的实体名(业务逻辑不使用)
+        aligned_entities_name = entities_name_aligned.get('entities_aligned_name')
+        # 获取所有对齐后的实体详情（结构信息细粒）
+        aligned_entities_info = entities_name_aligned.get('entities_aligned_elements')
+        # 构建商品名+实体名的pair对
+        item_entity_pairs: List[ItemEntityPair] = _build_item_entity_pairs(aligned_entities_info)
+
+        # 2.2 利用Neo4J的读取器组件对Neo4J进行相关的查询(Neo4J)
+        # a) 根商品名和实体名的pairs 查询种子节点
+        seed_nodes: List[EntitySeedNode] = neo4g_graph_reader.find_seed_nodes(item_entity_pairs)
+        # b) 根据种子节点查询一跳关系
+        one_hop_relations: List[OneHopRelation] = neo4g_graph_reader.find_one_hop_relations(seed_nodes)
+        # c)  根据种子节点(查询到的)以及一跳关系【种子节点/邻居节点】分别为其设置权重
+        weighted_nodes: List[Dict[str, Any]] = neo4g_graph_reader.collect_node_weight(seed_nodes, one_hop_relations)
+        # d) 根据带权重的节点反查chunk,并且基于权重给chunk排序（权重排【sum】降序/次数排降序/chunk_id升序）
+        chunk_nodes_sorted: List[Dict[str, Any]] = neo4g_graph_reader.find_nodes_chunk_id(weighted_nodes)
+
+        # 2.3 Milvus的操作(利用Chunk_Back_Filler回填器 进行反查chunk)
+        kg_chunks = chunk_back_filler.back_fill(chunk_nodes_sorted)
+
+        # 3. 将一跳关系转换成模型能够理解的真实图谱结构
+        triples_docs = _one_hop_relations_to_texts(one_hop_relations)
+
+        # 4. 汇总知识图谱节点的所有信息
+        return {
+            "kg_chunks": kg_chunks,  # 回填后的切片文本 → 送入 RRF
+            "kg_triples": triples_docs,  # 关系文本描述 → 送入答案生成 prompt
+            "kg_seed_nodes": seed_nodes,
+            "kg_triples_raw": one_hop_relations,
+            "kg_entities": entities_name,
+            "kg_aligned_entities": aligned_entities_name,
+            "kg_alignments": aligned_entities_info,
+        }
+
+
+if __name__ == '__main__':
+    # 知识图的检索这一路主要是根据精确的实体名帮我查下一部分出来，但是应用不会只靠这一路查询
+    # 其它路（语义相似这一路会根据我的语义相似查询）
+    kg_search_node = KnowledgeGraphSearchNode()
+    state = {
+        # "rewritten_query": "RS-12数字万用表如何测量直流电压",    （没有查询到）
+        # "rewritten_query": "RS-12数字万用表如何进行直流电压的测量",  # （没有查询到）
+        # "rewritten_query": "RS-12数字万用表如何打开背光灯键",
+        # "rewritten_query": "RS-12数字万用表更换电池需要注意什么",
+        # "rewritten_query": "RS-12数字万用表更换电池需要注意什么",   # 1.0
+        # "rewritten_query": "RS-12数字万用表如何测量电阻",  # 1.0  （没有查询到）
+        "rewritten_query": "RS-12数字万用表如何进行电阻测量",  # 1.0
+        # "rewritten_query": "在RS-12 数字万用表中二极管的操作步骤是什么",
+        # "rewritten_query": "RS-12数字万",
+        # "item_names": ["RS-12数字万用表"]
+        "item_names": ["RS PRO 万用表 RS-12"]
+    }
+    result = kg_search_node.process(state)
+
+    print(result)
