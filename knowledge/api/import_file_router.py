@@ -1,6 +1,6 @@
 # 必须最先执行：dotenv 默认找 cwd 下的 .env，但 cwd 是 knowledge/，所以指向父目录
 from dotenv import load_dotenv
-load_dotenv(r"E:\rag\docretri_rag\.env", override=True)
+load_dotenv(r"/.env", override=True)
 
 import os.path
 
@@ -41,7 +41,7 @@ def create_app() -> FastAPI:
     # 3. 将静态资源的目录挂载到app实例上
     front_page_dir = get_front_page_dir()
     if front_page_dir and os.path.exists(front_page_dir):
-        app.mount("/front", StaticFiles(directory=front_page_dir))
+        app.mount("../front", StaticFiles(directory=front_page_dir))
 
     # 4. 注册路由（接收前端发送的各种方式的请求）
     register_router(app)
