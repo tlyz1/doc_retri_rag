@@ -1,4 +1,4 @@
-# 掌柜智库 · 企业文档智能知识库（GraphRAG）
+# 企业文档智能知识库（GraphRAG）
 
 > 基于 **LangGraph** 的图谱增强 RAG（GraphRAG）系统：把 PDF/Markdown 产品文档自动变成可问答的知识库。
 > 导入侧完成文档解析、图片语义提取、三级切片、混合向量化与知识图谱构建；查询侧用「**BGE-M3 混合向量 + HyDE 假设文档 + Neo4j 知识图谱**」三路召回，经 RRF 加权融合、BGE-Reranker 精排后生成答案，并通过 SSE 流式输出。
