@@ -31,14 +31,17 @@ class HyDeSearchNode(BaseNode):
         embedding_model = get_bge_m3_embedding_model()
         milvus_client = get_milvus_client()
         if not embedding_model or not milvus_client:
-            return state
+            # 依赖不可用时返回空更新：本节点没有自己的切片要写，保持 state 其它字段原值不变。
+            # 不能 return state ——并行超步里回写整个 state 会与 query_kg 的 kg_chunks 写入冲突，报 InvalidUpdateError
+            return {}
 
         # 4. 假设性文档嵌入(注入问题+假设性文档)
         embedding_document = f"{validated_query}\n{hy_document}"
         embedding_result = generate_hybrid_embeddings(embedding_model, embedding_documents=[embedding_document])
 
         if not embedding_result:
-            return state
+            # 同上：嵌入失败时返回空更新
+            return {}
 
         # 5. 获取item_name的过滤表达式
         item_name_filtered_expr = self._item_name_filte_expr(validate_item_names)
@@ -56,7 +59,8 @@ class HyDeSearchNode(BaseNode):
                                            output_fields=["chunk_id", "content", "item_name"])
 
         if not reps or not reps[0]:
-            return state
+            # 同上：检索为空时返回空更新
+            return {}
 
 
 

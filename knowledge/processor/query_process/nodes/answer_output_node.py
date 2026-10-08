@@ -69,7 +69,11 @@ class AnswerOutputNode(BaseNode):
         for message in chat_history:
             role=message.get('role','')
             text=message.get('text','')
-            if not text or role in role_label_map:
+            # 只保留 user / assistant 两类角色。
+            # 原先写成 `role in role_label_map`，会把所有正常角色都 continue 掉
+            #（历史对话永远为空），而且下一行 `role_label_map[role]` 只在
+            # 角色"不在"映射表里时才会执行，遇到其它角色还会 KeyError。
+            if not text or role not in role_label_map:
                 continue
             formatted_line=f'{role_label_map[role]}:{text}'
             used_chars+=len(formatted_line)+1

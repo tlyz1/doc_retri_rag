@@ -22,11 +22,14 @@ class VectorSearchNode(BaseNode):
         embedding_model=get_bge_m3_embedding_model()
         milvus_client = get_milvus_client()
         if embedding_model is None or milvus_client is None:
-            return state
+            # 依赖不可用时返回空更新：本节点没有自己的切片要写，保持 state 其它字段原值不变。
+            # 不能 return state ——并行超步里回写整个 state 会与 query_kg 的 kg_chunks 写入冲突，报 InvalidUpdateError
+            return {}
         #对问题进行向量化
         embedding_result=generate_hybrid_embeddings(embedding_model,embedding_documents=[validated_query])
         if not embedding_model:
-            return state
+            # 同上：嵌入失败时返回空更新
+            return {}
         #构建过滤表达式
         item_name_filter_expr=self._item_name_filter(validate_item_names)
 
@@ -46,7 +49,8 @@ class VectorSearchNode(BaseNode):
             output_fields=['chunk_id','content','item_name']
         )
         if not reps or not reps[0]:
-            return state
+            # 同上：检索为空时返回空更新
+            return {}
         return {'embedding_chunks':reps[0]}
 
     def _validate_query_inputs(self, state: QueryGraphState) -> Tuple[str, List[str]]:

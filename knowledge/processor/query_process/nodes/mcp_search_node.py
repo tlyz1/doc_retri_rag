@@ -34,7 +34,9 @@ class McpSearchNode(BaseNode):
         mcp_result = asyncio.run(self._create_execute_web_search(validated_rewritten_query))
 
         if not mcp_result:
-            return state
+            # 网络检索无结果时返回空更新：本节点没有自己的网页结果要写，保持 state 其它字段原值不变。
+            # 不能 return state ——并行超步里回写整个 state 会与 query_kg 的 kg_chunks 写入冲突，报 InvalidUpdateError
+            return {}
 
         # 3. 更新state web_search_docs
 

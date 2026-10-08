@@ -444,7 +444,19 @@
                 body: formData
             });
 
-            if (!response.ok) throw new Error('Upload failed');
+            if (!response.ok) {
+                // 后端会给出明确原因：409=该文档已导入过；503=导入登记服务不可用
+                let detail = `请求失败（HTTP ${response.status}）`;
+                try {
+                    const errBody = await response.json();
+                    if (errBody && errBody.detail) detail = errBody.detail;
+                } catch (e) {
+                    // 响应体不是 JSON，用上面的默认文案
+                }
+                const err = new Error(detail);
+                err.status = response.status;
+                throw err;
+            }
 
             const result = await response.json();
             const taskId = result.task_id;
@@ -458,12 +470,13 @@
 
         } catch (error) {
             console.error(error);
-            statusBadge.textContent = '上传失败';
+            const duplicated = error.status === 409;
+            statusBadge.textContent = duplicated ? '已导入' : '上传失败';
             statusBadge.className = 'status-badge status-error';
             updateProgressUI(progressWrapper, 0);
 
             const errLog = document.createElement('li');
-            errLog.textContent = "❌ 网络请求失败或服务器异常";
+            errLog.textContent = (duplicated ? "⚠️ " : "❌ ") + (error.message || "网络请求失败或服务器异常");
             errLog.style.color = "#ef4444";
             logListEl.appendChild(errLog);
         }

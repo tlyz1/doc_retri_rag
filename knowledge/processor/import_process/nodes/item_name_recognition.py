@@ -2,6 +2,7 @@
 商品名称识别节点
 从文档切片中识别商品/产品名称
 """
+import hashlib
 from operator import index
 
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -10,7 +11,7 @@ from pymilvus import DataType
 
 from knowledge.processor.import_process.base import BaseNode
 from knowledge.processor.import_process.config import get_config
-from knowledge.processor.import_process.exceptions import ValidationError
+from knowledge.processor.import_process.exceptions import MilvusError, ValidationError
 from knowledge.processor.import_process.state import ImportGraphState
 from knowledge.tools.embedding_utils import get_bge_m3_embedding_model
 from knowledge.tools.llm_utils import get_llm_client
@@ -34,7 +35,7 @@ class ItemNameRecognitionNode(BaseNode):
         config = get_config()
 
         # 输入验证
-        file_title, chunks = self._validate_inputs(state)
+        file_title, chunks, doc_id = self._validate_inputs(state)
 
         # 构造识别上下文
         context = self._build_context(chunks, config.item_name_chunk_k)
@@ -49,22 +50,25 @@ class ItemNameRecognitionNode(BaseNode):
         dense_vector, sparse_vector = self._generate_vectors(item_name)
 
         # 保存到 Milvus
-        self._save_to_milvus(state, file_title, item_name, dense_vector, sparse_vector, config)
+        self._save_to_milvus(state, doc_id, file_title, item_name, dense_vector, sparse_vector, config)
 
         return state
 
-    def _validate_inputs(self, state: ImportGraphState) -> Tuple[str, List[dict]]:
+    def _validate_inputs(self, state: ImportGraphState) -> Tuple[str, List[dict], str]:
         """验证输入"""
         self.log_step("step1", "验证输入")
         file_title = state.get("file_title", "")
+        doc_id = str(state.get("doc_id", "")).strip()
         chunks = state.get("chunks", [])
         if not file_title:
             raise ValidationError(f"file_title为空", node_name=self.name)
+        if not doc_id:
+            raise ValidationError(f"doc_id为空，无法保证写入幂等", node_name=self.name)
         if not isinstance(chunks, list) or not chunks:
             raise ValidationError(f"chunks为空或者无效", node_name=self.name)
 
-        self.logger.info(f"文件标题：{file_title},切片数:{len(chunks)}")
-        return file_title, chunks
+        self.logger.info(f"文件标题：{file_title},doc_id:{doc_id},切片数:{len(chunks)}")
+        return file_title, chunks, doc_id
 
     def _build_context(self, chunks: List[dict], k: int, max_chars: int = 2500) -> str:
         """构造识别上下文"""
@@ -153,13 +157,19 @@ class ItemNameRecognitionNode(BaseNode):
     def _save_to_milvus(
             self,
             state: ImportGraphState,
+            doc_id: str,
             file_title: str,
             item_name: str,
             dense_vector: Optional[List[float]],
             sparse_vector: Optional[dict],
             config
     ):
-        """保存到 Milvus"""
+        """
+        保存到 Milvus
+
+        一份文档一条商品名记录，主键 pk = sha1(doc_id)[:32]。
+        同一份内容重复导入写的是同一行（upsert 覆盖），不会堆出多行。
+        """
         self.log_step("step_6", "保存到 Milvus")
 
         if not config.milvus_url or not config.item_name_collection:
@@ -170,7 +180,12 @@ class ItemNameRecognitionNode(BaseNode):
             collection_name = config.item_name_collection
             if not client.has_collection(collection_name):
                 self._create_item_name_collection(client, collection_name)
+            else:
+                # 老集合主键不兼容时直接抛错，不能被下面的兜底 except 吞成一条 warning
+                self._assert_primary_key_compatible(client, collection_name)
             data = {
+                "pk": self._build_primary_key(doc_id),
+                "doc_id": doc_id,
                 "file_title": file_title,
                 "item_name": item_name
             }
@@ -179,20 +194,50 @@ class ItemNameRecognitionNode(BaseNode):
             if sparse_vector is not None:
                 data["sparse_vector"] = sparse_vector
 
-            result = client.insert(collection_name=collection_name, data=[data])
-            self.logger.info(f"已经保存到Milvus，ID:{result['ids'][0]}")
+            client.upsert(collection_name=collection_name, data=[data])
+            self.logger.info(f"已经保存到Milvus，pk:{data['pk']}")
             state['item_name'] = item_name
 
+        except MilvusError:
+            raise
         except Exception as e:
             self.logger.warning(f"Milvus保存失败：{str(e)}")
+
+    @staticmethod
+    def _build_primary_key(doc_id: str) -> str:
+        """一份文档一条商品名记录：pk = sha1(doc_id)[:32]"""
+        return hashlib.sha1(doc_id.encode("utf-8")).hexdigest()[:32]
+
+    def _assert_primary_key_compatible(self, client, collection_name: str) -> None:
+        """
+        老集合的主键是 VARCHAR + auto_id（服务端生成），与现在的确定性主键不兼容，
+        upsert 会被 Milvus 直接拒绝。这里提前给出明确提示，避免静默写不进去。
+        """
+        try:
+            description = client.describe_collection(collection_name=collection_name)
+        except Exception as e:
+            self.logger.warning(f"读取集合{collection_name}结构失败，跳过主键兼容性检查：{e}")
+            return
+
+        collection_auto_id = description.get("auto_id")
+        for field in description.get("fields", []):
+            if field.get("is_primary"):
+                pk_type = field.get("type")
+                pk_auto_id = field.get("auto_id", collection_auto_id)
+                if pk_type != DataType.VARCHAR or pk_auto_id:
+                    raise MilvusError(
+                        f"集合{collection_name}的主键(auto_id={pk_auto_id}, 类型={pk_type})，"
+                        f"与新的确定性主键（VARCHAR + 非自增）不兼容。请删除该集合后重新导入。"
+                    )
 
     def _create_item_name_collection(self, client, collection_name: str):
         """创建 item_name 集合"""
         self.logger.info(f"创建集合: {collection_name}")
         schema = client.create_schema(enable_dynamic_schema=True)
-        # 定义字段
+        # 定义字段（主键是确定性 VARCHAR，由节点本地计算，不用自增）
         schema.add_field(field_name="pk", datatype=DataType.VARCHAR,
-                         is_primary=True, auto_id=True, max_length=100)
+                         is_primary=True, auto_id=False, max_length=64)
+        schema.add_field(field_name="doc_id", datatype=DataType.VARCHAR, max_length=64)
         schema.add_field(field_name="file_title", datatype=DataType.VARCHAR, max_length=65535)
         schema.add_field(field_name="item_name", datatype=DataType.VARCHAR, max_length=65535)
         schema.add_field(field_name="dense_vector", datatype=DataType.FLOAT_VECTOR, dim=1024)
@@ -254,6 +299,7 @@ if __name__ == '__main__':
         # 构建 state 状态
         state = {
             "file_title": "万用表的使用",
+            "doc_id": "test_doc_id_0001",
             "chunks": chunk_list
         }
 

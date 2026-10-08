@@ -22,16 +22,33 @@ class QueryConfig:
 
     # ==================== Rerank 配置 ====================
     rerank_max_top_k: int = field(
-        default_factory=lambda: int(os.getenv("RERANK_MAX_TOP_K", "10"))
+        default_factory=lambda: int(os.getenv("RERANK_MAX_TOP_K", "15"))
     )
     rerank_min_top_k: int = field(
-        default_factory=lambda: int(os.getenv("RERANK_MIN_TOP_K", "3"))
+        default_factory=lambda: int(os.getenv("RERANK_MIN_TOP_K", "8"))
     )
     rerank_gap_ratio: float = field(
-        default_factory=lambda: float(os.getenv("RERANK_GAP_RATIO", "0.25"))
+        default_factory=lambda: float(os.getenv("RERANK_GAP_RATIO", "0.5"))
     )
     rerank_gap_abs: float = field(
-        default_factory=lambda: float(os.getenv("RERANK_GAP_ABS", "0.5"))
+        default_factory=lambda: float(os.getenv("RERANK_GAP_ABS", "1.0"))
+    )
+
+    # ==================== 网络兜底检索配置 ====================
+    # 网页（MCP）检索原与本地三路并行执行，会把通用万用表文章混进上下文、稀释精排信噪比。
+    # 现改为「本地召回不足时才联网兜底」：mcp 节点挪到 rrf 之后由条件边触发。
+    web_fallback_enabled: bool = field(
+        default_factory=lambda: os.getenv("WEB_FALLBACK_ENABLED", "1").lower() in ("1", "true", "yes", "y")
+    )
+    # 本地召回不足的判据一：RRF 融合后的本地切片数少于该值 → 触发网络兜底
+    web_fallback_min_local_chunks: int = field(
+        default_factory=lambda: int(os.getenv("WEB_FALLBACK_MIN_LOCAL_CHUNKS", "3"))
+    )
+    # 本地召回不足的判据二（可选）：本地最高归一化相似度低于该值也触发（0 = 关闭）。
+    # 实测本项目知识库的归一化分数不具区分度（有答案 0.72~0.73，知识库没有答案 0.69~0.70，
+    # 只要商品名在库里就会返回高分切片），故默认关闭，避免误触发。
+    web_fallback_min_local_score: float = field(
+        default_factory=lambda: float(os.getenv("WEB_FALLBACK_MIN_LOCAL_SCORE", "0"))
     )
 
     # ==================== RRF 配置 ====================

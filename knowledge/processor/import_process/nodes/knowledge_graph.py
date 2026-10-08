@@ -1,3 +1,4 @@
+import hashlib
 import json, time, re, logging
 from concurrent.futures import ThreadPoolExecutor,as_completed
 import  threading
@@ -42,14 +43,19 @@ DEFAULT_RELATION_TYPES = "RELATED_TO"
 # ------------------------------------------
 # Neo4J的Cypher语句
 # ------------------------------------------
-# Chunk标签节点创建
+# 说明：节点身份用 doc_id（文档内容哈希），item_name 只作为展示属性。
+#      item_name 是每次导入让 LLM 重新提取的，同一份文档两次导入可能得到不同的名字，
+#      一旦让它参与键或清理条件，"清理旧数据"就会删不到东西（原脏数据 bug 的根因）。
+
+# Chunk标签节点创建（chunk_id = sha1(doc_id:切片序号)，全局唯一，所以只按 id 合并）
 CYPHER_MERGE_CHUNK = """
-    MERGE (c:Chunk {id: $chunk_id, item_name: $item_name})
+    MERGE (c:Chunk {id: $chunk_id})
+    SET c.doc_id = $doc_id, c.item_name = $item_name
 """
 
-# Entity标签节点的创建
+# Entity标签节点的创建（身份 = 实体名 + doc_id）
 CYPHER_MERGE_ENTITY_TEMPLATE = """
-    MERGE (n:Entity {{name: $name, item_name: $item_name}})
+    MERGE (n:Entity {{name: $name, doc_id: $doc_id}})
     ON CREATE SET
         n.source_chunk_id = $chunk_id,
         n.description     = $description
@@ -58,26 +64,26 @@ CYPHER_MERGE_ENTITY_TEMPLATE = """
             WHEN $description <> "" THEN $description
             ELSE coalesce(n.description, "")
         END
-    SET n:`{label}`
+    SET n.item_name = $item_name, n:`{label}`
 """
 # Entity关联Chunk
 CYPHER_LINK_ENTITY_TO_CHUNK = """
-    MATCH (n:Entity {name: $name, item_name: $item_name})
-    MATCH (c:Chunk  {id: $chunk_id, item_name: $item_name})
+    MATCH (n:Entity {name: $name, doc_id: $doc_id})
+    MATCH (c:Chunk  {id: $chunk_id})
     MERGE (n)-[:MENTIONED_IN]->(c)
 """
 
 # Entity与Entity的关系
 CYPHER_MERGE_RELATION_TEMPLATE = """
-    MATCH (h:Entity {{name: $head, item_name: $item_name}})
-    MATCH (t:Entity {{name: $tail, item_name: $item_name}})
+    MATCH (h:Entity {{name: $head, doc_id: $doc_id}})
+    MATCH (t:Entity {{name: $tail, doc_id: $doc_id}})
     MERGE (h)-[:{rel_type}]->(t)
 """
 
 
-# 清理Neo4J数据
-CYPHER_CLEAR_ITEM = """
-    MATCH (n {item_name: $item_name}) DETACH DELETE n
+# 清理Neo4J数据（按 doc_id 清掉这份文档的整份图谱）
+CYPHER_CLEAR_DOC = """
+    MATCH (n {doc_id: $doc_id}) DETACH DELETE n
 """
 
 
@@ -105,22 +111,22 @@ class _Neo4jGraphWriter:
         self._database = database
         self._logger = logging.getLogger(self.__class__.__name__)
 
-    def clear(self, neo4j_driver, item_name: str) -> None:
+    def clear(self, neo4j_driver, doc_id: str) -> None:
         if not neo4j_driver:
             raise Neo4jError("Neo4j 驱动获取失败")
 
         try:
             with self._session(neo4j_driver) as session:
                 session.execute_write(
-                    lambda tx, name: tx.run(CYPHER_CLEAR_ITEM, item_name=name),
-                    item_name,
+                    lambda tx, doc: tx.run(CYPHER_CLEAR_DOC, doc_id=doc),
+                    doc_id,
                 )
-            self._logger.info(f"Neo4j 旧数据已清理: {item_name}")
+            self._logger.info(f"Neo4j 旧数据已清理: doc_id={doc_id}")
         except Exception as e:
             raise Neo4jError(f"Neo4j 清理失败: {e}")
 
 
-    def insert(self, driver, entities, relations, chunk_id, item_name):
+    def insert(self, driver, entities, relations, chunk_id, item_name, doc_id):
         """
         Neo4J的写入
 
@@ -128,8 +134,9 @@ class _Neo4jGraphWriter:
             driver: neo4j的驱动
             entities:  清洗后的实体
             relations: 清洗后的关系链
-            chunk_id:  实体对应的chunk_id
-            item_name: 文档对应LLM提取的商品名
+            chunk_id:  实体对应的chunk_id（确定性主键，已含 doc_id）
+            item_name: 文档对应LLM提取的商品名（只作属性，不参与键）
+            doc_id:    文档身份（内容哈希），节点身份与清理都以它为准
 
         Returns:
 
@@ -145,16 +152,16 @@ class _Neo4jGraphWriter:
         try:
             with self._session(driver) as session:
                 session.execute_write(
-                    self._write_graph_tx, entities, relations, chunk_id, item_name,
+                    self._write_graph_tx, entities, relations, chunk_id, item_name, doc_id,
                 )
             self._logger.info(f"Neo4j 写入: {len(entities)} 实体, {len(relations)} 关系")
         except Exception as e:
             raise Neo4jError(f"Neo4j 写入失败: {e}")
 
-    def _write_graph_tx(self, tx, entities, relations, chunk_id, item_name):
+    def _write_graph_tx(self, tx, entities, relations, chunk_id, item_name, doc_id):
 
         # 1. 创建 Chunk 节点
-        tx.run(CYPHER_MERGE_CHUNK, chunk_id=chunk_id, item_name=item_name)
+        tx.run(CYPHER_MERGE_CHUNK, chunk_id=chunk_id, item_name=item_name, doc_id=doc_id)
 
         # 2. 创建实体节点 + 关联到 Chunk
         for entity in entities:
@@ -166,11 +173,11 @@ class _Neo4jGraphWriter:
             cypher_query = CYPHER_MERGE_ENTITY_TEMPLATE.format(label=raw_label)
 
             tx.run(cypher_query, name=name, description=description,
-                   chunk_id=chunk_id, item_name=item_name)
+                   chunk_id=chunk_id, item_name=item_name, doc_id=doc_id)
 
             # 关联实体到 Chunk
             tx.run(CYPHER_LINK_ENTITY_TO_CHUNK,
-                   name=name, chunk_id=chunk_id, item_name=item_name)
+                   name=name, chunk_id=chunk_id, doc_id=doc_id)
 
         # 3. 创建实体间关系
         for rel in relations:
@@ -179,7 +186,7 @@ class _Neo4jGraphWriter:
             rel_type = rel.get("type")
 
             cypher = CYPHER_MERGE_RELATION_TEMPLATE.format(rel_type=rel_type)
-            tx.run(cypher, head=head, tail=tail, item_name=item_name)
+            tx.run(cypher, head=head, tail=tail, doc_id=doc_id)
 
 
 
@@ -195,9 +202,9 @@ class _MilvusEntityWriter:
         self.logger = logging.getLogger(self.__class__.__name__)
 
 
-    def  clear(self,milvus_client:MilvusClient,item_name:str):
+    def  clear(self,milvus_client:MilvusClient,doc_id:str):
 
-        # 1. 清理 Milvus
+        # 1. 清理 Milvus（按 doc_id；item_name 每次导入都可能变，不能当清理条件）
         if not milvus_client:
             raise MilvusError("Milvus 客户端获取失败")
 
@@ -206,14 +213,15 @@ class _MilvusEntityWriter:
             if milvus_client.has_collection(collection_name):
                 milvus_client.delete(
                     collection_name=collection_name,
-                    filter=f'item_name == "{item_name}"',
+                    filter=f'doc_id == "{doc_id}"',
                 )
-                self.logger.info(f"Milvus 旧数据已清理: item_name={item_name}")
+                self.logger.info(f"Milvus 旧数据已清理: doc_id={doc_id}")
         except Exception as e:
             raise MilvusError(f"Milvus 清理失败: {e}")
 
-    def insert(self, milvus_client, entities: List[Dict], chunk_id: str, content: str, item_name: str) -> None:
-        """对外唯一入口：将实体写入 Milvus。"""
+    def insert(self, milvus_client, entities: List[Dict], chunk_id: str, content: str, item_name: str,
+               doc_id: str) -> None:
+        """对外唯一入口：将实体写入 Milvus（主键由 doc_id/chunk_id/实体名算出，重复导入即覆盖）。"""
 
         # 1. 判断实体是否存在
         if not entities:
@@ -244,13 +252,13 @@ class _MilvusEntityWriter:
             raise MilvusError(f"实体嵌入失败: {e}")
 
         # 6. 构建记录
-        records = self._build_records(entities_names, embedded_result, chunk_id, content, item_name)
+        records = self._build_records(entities_names, embedded_result, chunk_id, content, item_name, doc_id)
         if not records:
             raise MilvusError("构建 Milvus 记录为空")
 
-        # 7. 写入 Milvus
+        # 7. 写入 Milvus（确定性主键 → upsert 覆盖）
         try:
-            milvus_client.insert(collection_name=self.collection_name, data=records)
+            milvus_client.upsert(collection_name=self.collection_name, data=records)
             self.logger.info(f"Milvus 写入 {len(records)} 条实体向量")
         except Exception as e:
             raise MilvusError(f"Milvus 插入数据失败: {e}")
@@ -260,11 +268,14 @@ class _MilvusEntityWriter:
 
         # 1. 判断集合是否已存在
         if client.has_collection(collection_name):
+            self._assert_primary_key_compatible(client, collection_name)
             return
 
         # 2. 构建 schema
         schema = client.create_schema(enable_dynamic_field=True)
-        schema.add_field("pk", DataType.INT64, is_primary=True, auto_id=True)
+        # 主键是确定性 VARCHAR（sha1(doc_id:chunk_id:实体名)），不用自增
+        schema.add_field("pk", DataType.VARCHAR, is_primary=True, auto_id=False, max_length=64)
+        schema.add_field("doc_id", DataType.VARCHAR, max_length=64)
         schema.add_field("entity_name", DataType.VARCHAR, max_length=65535)
         schema.add_field("dense_vector", DataType.FLOAT_VECTOR, dim=1024)
         schema.add_field("sparse_vector", DataType.SPARSE_FLOAT_VECTOR)
@@ -295,6 +306,28 @@ class _MilvusEntityWriter:
             index_params=index_params,
         )
 
+    def _assert_primary_key_compatible(self, client, collection_name: str) -> None:
+        """
+        老集合的主键是 INT64 自增，与本次改造的确定性 VARCHAR 主键不兼容。
+        这里提前给出明确提示，避免后面报一个看不懂的 upsert 错误。
+        """
+        try:
+            description = client.describe_collection(collection_name=collection_name)
+        except Exception as e:
+            self.logger.warning(f"读取集合{collection_name}结构失败，跳过主键兼容性检查：{e}")
+            return
+
+        collection_auto_id = description.get("auto_id")
+        for field in description.get("fields", []):
+            if field.get("is_primary"):
+                pk_type = field.get("type")
+                pk_auto_id = field.get("auto_id", collection_auto_id)
+                if pk_type != DataType.VARCHAR or pk_auto_id:
+                    raise MilvusError(
+                        f"集合{collection_name}的主键(auto_id={pk_auto_id}, 类型={pk_type})，"
+                        f"与新的确定性主键（VARCHAR + 非自增）不兼容。请删除该集合后重新导入。"
+                    )
+
     @staticmethod
     def _build_records(
             entities_names: List[str],
@@ -302,6 +335,7 @@ class _MilvusEntityWriter:
             chunk_id: str,
             content: str,
             item_name: str,
+            doc_id: str,
     ) -> List[Dict[str, Any]]:
         """组装插入记录。"""
 
@@ -339,6 +373,10 @@ class _MilvusEntityWriter:
 
             # 5.4 构建单条记录
             record = {
+                "pk": hashlib.sha1(
+                    f"{doc_id}:{chunk_id}:{entity_name}".encode("utf-8")
+                ).hexdigest()[:32],
+                "doc_id": doc_id,
                 "entity_name": entity_name,
                 "context": context,
                 "item_name": item_name,
@@ -365,6 +403,11 @@ class KnowLedgeGraphNode(BaseNode):
         # 1. 参数校验
         validated_chunks, item_name = self._validate_get_inputs(state)
 
+        # 1.1 文档身份：缺失就直接失败，这是幂等与清理的唯一依据
+        doc_id = str(state.get("doc_id", "")).strip()
+        if not doc_id:
+            raise ValueError("缺少 doc_id，无法保证知识图谱写入幂等")
+
         # 2. 构建统计初始信息
         stats = ProcessingStats(total_chunks=len(validated_chunks))
 
@@ -373,16 +416,16 @@ class KnowLedgeGraphNode(BaseNode):
         milvus_client = get_milvus_client()
         neo4j_driver = get_neo4j_driver()
 
-        # 4. 删除已经存在的数据（3.1 删除milvus中存储实体名字的记录（delete:item_name）：幂等性保证 3.2 删除neo4j的整个库下的所有节点以及关系）
-        self._clean_exist_double_data(milvus_client, neo4j_driver, item_name)
+        # 4. 按 doc_id 删除这份文档已经存在的数据（Milvus + Neo4j）：幂等性保证
+        self._clean_exist_double_data(milvus_client, neo4j_driver, doc_id)
 
         # 5. 批量处理（串行版本）
         # 注意：当前 chunk 流程里会调用 BGEM3EmbeddingFunction（PyTorch 模型），
         # PyTorch/BGE-M3 同一实例不能并发 encode，多线程版本会让向量异常甚至段错误。
         # 因此默认走串行版本，多线程版保留作为 TODO 性能优化参考。
-        self._process_all_chunks_v1(stats, validated_chunks, milvus_client, neo4j_driver)
+        self._process_all_chunks_v1(stats, validated_chunks, milvus_client, neo4j_driver, doc_id)
         # 5. 批量处理（多线程版本）—— BGE-M3 串行化前禁用
-        # self._process_chunks_concurrently(stats, validated_chunks, milvus_client, neo4j_driver)
+        # self._process_chunks_concurrently(stats, validated_chunks, milvus_client, neo4j_driver, doc_id)
 
         # 6. 简单的日志观察
         self.logger.info(stats.summary())
@@ -390,34 +433,36 @@ class KnowLedgeGraphNode(BaseNode):
         return state
 
     def _clean_exist_double_data(self, milvus_client: MilvusClient, neo4j_driver,
-                                 item_name: str):
+                                 doc_id: str):
         """
-        删除milvus以及neo4j的对应文档的记录
+        删除该文档（doc_id）在 milvus 以及 neo4j 的旧记录
         Args:
             milvus_client:
             neo4j_driver:
-            item_name:
+            doc_id: 文档身份（内容哈希），不用 LLM 提取的 item_name
 
         Returns:
 
         """
-        # 3.1 导入前清理该 item_name 下的所有旧数据（Milvus）
-        self._milvus_writer.clear(milvus_client,item_name)
+        # 3.1 导入前清理该 doc_id 下的所有旧数据（Milvus）
+        self._milvus_writer.clear(milvus_client,doc_id)
 
-        # 3.1 导入前清理该 item_name 下的所有旧数据（Neo4J）
-        self._neo4j_writer.clear(neo4j_driver,item_name)
+        # 3.2 导入前清理该 doc_id 下的所有旧数据（Neo4J）
+        self._neo4j_writer.clear(neo4j_driver,doc_id)
 
 
     def _process_all_chunks_v1(self, stats: ProcessingStats,
                                validated_chunks: List[Dict[str, Any]],
                                milvus_client: MilvusClient,
-                               neo4j_driver):
+                               neo4j_driver,
+                               doc_id: str):
         """
         循环处理每一个chunk
         Args:
             validated_chunks:
             milvus_client:
             neo4j_driver:
+            doc_id: 文档身份（内容哈希）
 
         Returns:
 
@@ -441,7 +486,8 @@ class KnowLedgeGraphNode(BaseNode):
                                                                              item_name,
                                                                              content,
                                                                              milvus_client,
-                                                                             neo4j_driver)
+                                                                             neo4j_driver,
+                                                                             doc_id)
                 stats.processed_chunks += 1
                 stats.total_entities += entities_count
                 stats.total_relations += relations_count
@@ -455,7 +501,8 @@ class KnowLedgeGraphNode(BaseNode):
                               item_name: str,
                               content: str,
                               milvus_client: MilvusClient,
-                              neo4j_driver) -> Tuple[int, int]:
+                              neo4j_driver,
+                              doc_id: str) -> Tuple[int, int]:
 
         llm_start = time.time()
         thread_name = threading.current_thread().name #  获取线程名
@@ -474,12 +521,12 @@ class KnowLedgeGraphNode(BaseNode):
         # 3. 写入
         # 3.1 将清洗后的实体名字（可能是多个）存储到milvus
         milvus_start = time.time()
-        self._milvus_writer.insert(milvus_client, final_entities, chunk_id, content, item_name)
+        self._milvus_writer.insert(milvus_client, final_entities, chunk_id, content, item_name, doc_id)
         milvus_cost = time.time() - milvus_start
 
         # 3.2 将清洗后的实体以及关系类型都存储到neo4j
         neo4j_start = time.time()
-        self._neo4j_writer.insert(neo4j_driver, final_entities, final_relations, chunk_id, item_name)
+        self._neo4j_writer.insert(neo4j_driver, final_entities, final_relations, chunk_id, item_name, doc_id)
         neo4j_cost = time.time() - neo4j_start
 
         total_cost = time.time() - llm_start
@@ -760,7 +807,7 @@ class KnowLedgeGraphNode(BaseNode):
 
         return validated_chunks, global_item_name
 
-    def _process_chunks_concurrently(self, stats:ProcessingStats, validated_chunks:List[Dict[str,Any]], milvus_client:MilvusClient, neo4j_driver):
+    def _process_chunks_concurrently(self, stats:ProcessingStats, validated_chunks:List[Dict[str,Any]], milvus_client:MilvusClient, neo4j_driver, doc_id: str):
         """
         多线程版本：
         多线程本质压榨CPU 和提高响应时间没有本质的关系
@@ -769,6 +816,7 @@ class KnowLedgeGraphNode(BaseNode):
             validated_chunks:
             milvus_client:
             neo4j_driver:
+            doc_id: 文档身份（内容哈希）
         Returns:
 
         """
@@ -784,7 +832,7 @@ class KnowLedgeGraphNode(BaseNode):
                 # 像线程池中提交任务 返回任务对象
                 future = pool.submit(
                     self._process_single_chunk,
-                     chunk_id,item_name, content, milvus_client,neo4j_driver
+                     chunk_id,item_name, content, milvus_client,neo4j_driver, doc_id
                 )
                 future_to_idx[future] = (i, chunk_id)
 
@@ -815,6 +863,7 @@ def test_kg_extraction():
 
     mock_state = {
         "item_name": "测试万用表",
+        "doc_id": "test_doc_id_0001",
         "chunks": [
             {
                 "content": """# 电池安装

@@ -7,6 +7,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.graph.state import CompiledStateGraph
 from dotenv import load_dotenv
 from knowledge.processor.query_process.state import QueryGraphState
+from knowledge.processor.query_process.config import get_config
 
 from knowledge.processor.query_process.nodes.answer_output_node import AnswerOutputNode
 from knowledge.processor.query_process.nodes.item_name_confirm_node import ItemNameConfirmNode
@@ -37,6 +38,64 @@ def route_after_item_confirm(state: QueryGraphState) -> bool:
     return False
 
 
+def is_local_recall_sufficient(state: QueryGraphState) -> bool:
+    """判断本地三路（向量 / HyDE / 知识图谱）召回是否足以支撑作答。
+
+    判定依据：
+        1. RRF 融合后的本地切片数是否达到 ``web_fallback_min_local_chunks``（默认 3 条）；
+        2. 可选判据：本地最高归一化相似度是否达到 ``web_fallback_min_local_score``
+           （默认 0，即不启用——实测本项目知识库的分数不具区分度，详见配置注释）。
+
+    Args:
+        state: 已经过 rrf 节点的查询图状态（此时 rrf_chunks / embedding_chunks 等已就绪）。
+
+    Returns:
+        True 表示本地召回充足（不需要联网兜底），False 表示需要网络检索补充。
+    """
+    config = get_config()
+
+    # 判据一：本地融合后的切片数量
+    local_chunks = state.get("rrf_chunks") or []
+    if len(local_chunks) < config.web_fallback_min_local_chunks:
+        return False
+
+    # 判据二（可选）：本地最高归一化相似度
+    min_score = config.web_fallback_min_local_score or 0
+    if min_score > 0:
+        scores = []
+        for key in ("embedding_chunks", "hyde_embedding_chunks"):
+            for hit in (state.get(key) or []):
+                if not isinstance(hit, dict):
+                    continue
+                try:
+                    scores.append(float(hit.get("distance") or 0))
+                except (TypeError, ValueError):
+                    continue
+        if scores and max(scores) < min_score:
+            return False
+
+    return True
+
+
+def route_after_rrf(state: QueryGraphState) -> str:
+    """RRF 之后的路由：本地召回不足才走网络兜底检索。
+
+    说明：网页检索原来与本地三路并行执行，并行超步里 MCP 节点看不到本地召回结果，
+    无法判断"本地是否不足"；因此把它挪到 rrf 之后，由本函数做条件分支。
+
+    Args:
+        state: 已经过 rrf 节点的查询图状态。
+
+    Returns:
+        "web"：本地召回不足，先执行 MCP 网络检索再精排；
+        "local"：本地召回充足，直接精排（不联网）。
+    """
+    config = get_config()
+    if not config.web_fallback_enabled:
+        return "local"
+    return "local" if is_local_recall_sufficient(state) else "web"
+
+
 def create_query_graph() -> CompiledStateGraph:
     """创建查询流程图。
 
@@ -47,31 +106,20 @@ def create_query_graph() -> CompiledStateGraph:
 
         item_name_confirm
               │
-              ├── (有答案) ────────────────────────────> answer_output
-              │                                              │
-              └── (无答案) ──> multi_search ─────┬──────────>│
-                                   │             │           │
-                         ┌─────────┼─────────────┼───────┐   │
-                         │         │             │       │   │
-                         v         v             v       v   │
-                   embedding  hyde_embedding  query_kg  web  │
-                         │         │             │       │   │
-                         └─────────┴─────────────┴───────┘   │
-                                       │                     │
-                                       v                     │
-                                     join                    │
-                                       │                     │
-                                       v                     │
-                                      rrf                    │
-                                       │                     │
-                                       v                     │
-                                    rerank                   │
-                                       │                     │
-                                       v                     │
-                               answer_output <───────────────┘
-                                       │
-                                       v
-                                      END
+              ├── (已有答案) ─────────────────────────────────> answer_output ──> END
+              │
+              └── (无答案) ─> multi_search ─┬─> search_embedding        ┐
+                                            ├─> search_embedding_hyde   ├─> join ─> rrf
+                                            └─> query_kg                ┘            │
+                                                                                     │
+                     ┌─────────────────────(本地召回充足)────────────────────────────┤
+                     │                                                               │
+                     │ (本地召回不足：web_fallback_enabled 且本地切片数 < 阈值)         │
+                     v                                                               v
+              web_search_mcp ────────────────────────────────────────────────────> rerank
+                                                                                     │
+                                                                                     v
+                                                                             answer_output ──> END
     """
 
     # 1. 定义LangGraph工作流
@@ -109,21 +157,29 @@ def create_query_graph() -> CompiledStateGraph:
         }
     )
 
-    # 6. 多路搜索分发（并行执行）
+    # 6. 本地三路搜索分发（并行执行）
+    #    注意：网页（MCP）检索不在这一步，改为 rrf 之后按"本地召回是否充足"条件触发
     workflow.add_edge("multi_search", "search_embedding")
     workflow.add_edge("multi_search", "search_embedding_hyde")
     workflow.add_edge("multi_search", "query_kg")
-    workflow.add_edge("multi_search", "web_search_mcp")
 
     # 7. 多路搜索汇合
     workflow.add_edge("search_embedding", "join")
     workflow.add_edge("search_embedding_hyde", "join")
     workflow.add_edge("query_kg", "join")
-    workflow.add_edge("web_search_mcp", "join")
 
     # 8. 顺序边
     workflow.add_edge("join", "rrf")
-    workflow.add_edge("rrf", "rerank")
+    # 8.1 本地召回不足时才走网络兜底检索（并行执行时 MCP 看不到本地结果，故改为顺序条件分支）
+    workflow.add_conditional_edges(
+        "rrf",
+        route_after_rrf,
+        {
+            "local": "rerank",
+            "web": "web_search_mcp",
+        }
+    )
+    workflow.add_edge("web_search_mcp", "rerank")
     workflow.add_edge("rerank", "answer_output")
     workflow.add_edge("answer_output", END)
 

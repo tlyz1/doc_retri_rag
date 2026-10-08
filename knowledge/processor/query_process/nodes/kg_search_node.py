@@ -74,11 +74,13 @@ RETURN
 limit $limit
 """
 # 根据带权重的节点查询chunk_id
+# 说明：Chunk 的身份已经是 id（= sha1(doc_id:切片序号)），归属由 MENTIONED_IN 关系本身限定，
+#      这里不再按 item_name 过滤 Chunk——否则同一个商品名分属两份文档时会把别份文档的切片捞进来。
 _CYPHER_LOOKUP_CHUNK = """
 
 UNWIND $weighted_nodes as n
 
-MATCH (e:Entity{name:n.entity_name,item_name:n.item_name})-[r:MENTIONED_IN]->(c:Chunk{item_name:n.item_name})
+MATCH (e:Entity{name:n.entity_name,item_name:n.item_name})-[r:MENTIONED_IN]->(c:Chunk)
 
 WITH c,sum(n.weight) AS score, count(e) AS cnt
 

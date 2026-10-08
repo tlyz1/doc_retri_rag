@@ -41,7 +41,9 @@ def create_app() -> FastAPI:
     # 3. 将静态资源的目录挂载到app实例上
     front_page_dir = get_front_page_dir()
     if front_page_dir and os.path.exists(front_page_dir):
-        app.mount("../front", StaticFiles(directory=front_page_dir))
+        # 挂载路径必须是绝对路径（以 / 开头），与 query_router.py 的 "/front" 保持一致。
+        # 原先写成 "../front"，Starlette 的 Mount 会直接断言失败（Routed paths must start with '/'）。
+        app.mount("/front", StaticFiles(directory=front_page_dir))
 
     # 4. 注册路由（接收前端发送的各种方式的请求）
     register_router(app)
@@ -63,15 +65,25 @@ def register_router(app: FastAPI):
     # 2. 上传请求
     @app.post("/upload", response_model=UploadResponse)
     async def upload_file_endpoint(background_tasks: BackgroundTasks, file: UploadFile = File(...),
+                                   overwrite: bool = True,
                                    service: ImportFileService = Depends(get_import_file_service)):
-        # 1. 上传文件（本地/minio）
-        task_id, file_dir, import_file_path = service.process_upload_file(file)
+        """
+        上传并导入一份文档。
+
+        overwrite=false（默认）：
+            同一份内容（doc_id 相同）已经完整导入过时返回 409，不产生任何新数据；
+            上次导入中断/失败留下的半截数据会被识别出来并放行重跑（按 doc_id 覆盖）。
+        overwrite=true：
+            即使已经导入过也重新跑一遍，写入侧按 doc_id 覆盖，不会新增重复数据。
+        """
+        # 1. 上传文件（本地/minio），并按内容哈希 doc_id 查重
+        task_id, file_dir, import_file_path, doc_id = service.process_upload_file(file, overwrite=overwrite)
 
         # 2. 运行后台任务（跑graph的整个流程）
-        background_tasks.add_task(service.run_import_graph, task_id, file_dir, import_file_path)
+        background_tasks.add_task(service.run_import_graph, task_id, file_dir, import_file_path, doc_id)
 
         # 3. 返回
-        return UploadResponse(message="文件上传成功", task_id=task_id)
+        return UploadResponse(message="文件上传成功", task_id=task_id, doc_id=doc_id, overwrite=overwrite)
 
 
     @app.get("/status/{task_id}", response_model=TaskStatusResponse)
